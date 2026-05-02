@@ -991,6 +991,42 @@ function studioStripControlCharsFromPackageJsonStrings(pkg) {
   return changed;
 }
 
+/** После vite build: вычищает остатки /assets/ в index и чанках (если base не применился). */
+function studioRewriteBuiltPreviewAbsolutes(distRoot) {
+  if (!distRoot || !fs.existsSync(distRoot)) return;
+  const idx = path.join(distRoot, 'index.html');
+  if (fs.existsSync(idx)) {
+    let html = fs.readFileSync(idx, 'utf8');
+    const next = html
+      .replace(/(src|href)=(["'])\/assets\//gi, '$1=$2./assets/')
+      .replace(/(src|href)=(["'])\/vite\//gi, '$1=$2./vite/');
+    if (next !== html) {
+      fs.writeFileSync(idx, next, 'utf8');
+      logAccess(`STUDIO_DIST_REWRITE index.html ${distRoot}`);
+    }
+  }
+  const assetsDir = path.join(distRoot, 'assets');
+  if (fs.existsSync(assetsDir) && fs.statSync(assetsDir).isDirectory()) {
+    for (const name of fs.readdirSync(assetsDir)) {
+      if (!name.endsWith('.js') && !name.endsWith('.mjs') && !name.endsWith('.css')) continue;
+      const fp = path.join(assetsDir, name);
+      let s;
+      try {
+        s = fs.readFileSync(fp, 'utf8');
+      } catch {
+        continue;
+      }
+      const o = s;
+      s = s.replace(/(["'`])\/assets\//g, '$1./assets/');
+      s = s.replace(/(["'`])\/vite\//g, '$1./vite/');
+      if (s !== o) {
+        fs.writeFileSync(fp, s, 'utf8');
+        logAccess(`STUDIO_DIST_REWRITE ${name}`);
+      }
+    }
+  }
+}
+
 /** Модель иногда пишет "a" - "b" в массиве вместо "a", "b". */
 function studioRepairHyphenBetweenJsonStrings(s) {
   let t = s;
@@ -1484,6 +1520,13 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
   }
   const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
+  if (r2.code === 0) {
+    try {
+      studioRewriteBuiltPreviewAbsolutes(path.join(ws, 'dist'));
+    } catch (e) {
+      logError(`STUDIO_DIST_REWRITE ${e.message}`);
+    }
+  }
   const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
   return { ok: r2.code === 0, exitCode: r2.code || 0, chunk: combined };
 }
@@ -4367,6 +4410,12 @@ app.use('/preview', (req, res, next) => {
   const qIdx = fullUrl.indexOf('?');
   const pathOnly = qIdx === -1 ? fullUrl : fullUrl.slice(0, qIdx);
   const qs = qIdx === -1 ? '' : fullUrl.slice(qIdx);
+  /** Документ без завершающего / (`/preview/token`) ломает разрешение `./assets/` → `/preview/assets/ (белый экран). */
+  const bareTokenOnly = pathOnly.match(/^\/([^/]+)$/);
+  if (bareTokenOnly) {
+    res.redirect(302, `/preview/${bareTokenOnly[1]}/` + qs);
+    return;
+  }
   const m = pathOnly.match(/^\/([^/]+)(\/.*)?$/);
   if (!m) {
     res.status(404).type('text/plain; charset=utf-8').send('Not found');

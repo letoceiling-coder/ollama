@@ -27,6 +27,17 @@ const AGENT_TOOLCHAIN = [
   'container · Docker',
 ] as const;
 
+/** Iframe: путь /preview/<token> без завершающего / ломает относительные ассеты (белый экран). */
+function normalizeStudioPreviewIframeSrc(url: string | null): string | null {
+  if (!url) return null;
+  if (!url.startsWith('/preview/')) return url;
+  const qi = url.indexOf('?');
+  const pathPart = qi === -1 ? url : url.slice(0, qi);
+  const rest = qi === -1 ? '' : url.slice(qi);
+  if (!pathPart.endsWith('/')) return `${pathPart}/${rest}`;
+  return url;
+}
+
 interface ChatTurn {
   id: string;
   role: 'user' | 'agent';
@@ -270,10 +281,11 @@ export function LovableStudio() {
     saveFileMu.isPending ||
     revisionMu.isPending;
 
-  const iframeRealSrc =
+  const iframeRaw =
     project?.taskStatus === 'ready_for_review' && projectId
       ? project.previewSharePath || studioPreviewUrl(projectId)
       : null;
+  const iframeRealSrc = useMemo(() => normalizeStudioPreviewIframeSrc(iframeRaw), [iframeRaw]);
 
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100">
