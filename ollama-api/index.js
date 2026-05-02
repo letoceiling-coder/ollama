@@ -635,6 +635,79 @@ function studioLucideReactRangeLooksInvalid(range) {
   return false;
 }
 
+/** Удаляет управляющие символы из всех строк в дереве package.json (LLM иногда вставляет U+0012 в версии). */
+function studioStripControlCharsFromPackageJsonStrings(pkg) {
+  const CTRL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+  let changed = false;
+  function walk(x) {
+    if (x == null || typeof x !== 'object') return;
+    if (Array.isArray(x)) {
+      for (let i = 0; i < x.length; i++) {
+        const v = x[i];
+        if (typeof v === 'string') {
+          const n = v.replace(CTRL, '');
+          if (n !== v) {
+            x[i] = n;
+            changed = true;
+          }
+        } else {
+          walk(v);
+        }
+      }
+      return;
+    }
+    for (const k of Object.keys(x)) {
+      const v = x[k];
+      if (typeof v === 'string') {
+        const n = v.replace(CTRL, '');
+        if (n !== v) {
+          x[k] = n;
+          changed = true;
+        }
+      } else {
+        walk(v);
+      }
+    }
+  }
+  walk(pkg);
+  return changed;
+}
+
+/**
+ * Если package.json битый (не парсится) — убираем управляющие символы из текста и перезаписываем.
+ * Возвращает true, если файл изменён (нужен npm install, lock удаляется).
+ */
+function studioRepairCorruptWorkspacePackageJson(wsRoot) {
+  const fp = path.join(wsRoot, 'package.json');
+  if (!fs.existsSync(fp)) return false;
+  let raw = fs.readFileSync(fp, 'utf8');
+  if (raw.length && raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+  try {
+    JSON.parse(raw);
+    return false;
+  } catch {
+    /* */
+  }
+  const stripped = raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
+  let pkg;
+  try {
+    pkg = JSON.parse(stripped);
+  } catch {
+    return false;
+  }
+  if (!pkg || typeof pkg !== 'object') return false;
+  studioStripControlCharsFromPackageJsonStrings(pkg);
+  fs.writeFileSync(fp, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  try {
+    const lock = path.join(wsRoot, 'package-lock.json');
+    if (fs.existsSync(lock)) fs.unlinkSync(lock);
+  } catch {
+    /* */
+  }
+  logAccess(`STUDIO_PACKAGE_JSON_REPAIR corrupt-json ${wsRoot}`);
+  return true;
+}
+
 /**
  * Исправляет типичные галлюцинации в package.json перед npm ci/install. Возвращает true, если lockfile нужно пересобрать.
  */
@@ -648,8 +721,8 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
     return false;
   }
   if (!pkg || typeof pkg !== 'object') return false;
+  let changed = studioStripControlCharsFromPackageJsonStrings(pkg);
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
-  let changed = false;
   for (const sec of sections) {
     const o = pkg[sec];
     if (!o || typeof o !== 'object') continue;
@@ -668,7 +741,7 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
     } catch {
       /* */
     }
-    logAccess(`STUDIO_PACKAGE_SANITIZE lucide-react -> ${STUDIO_NPM_LUCIDE_REACT} in ${wsRoot}`);
+    logAccess(`STUDIO_PACKAGE_SANITIZE ${wsRoot}`);
   }
   return changed;
 }
@@ -999,12 +1072,14 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const planMd = project?.plan?.markdown || '';
   if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
 
+  const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
-  const useNpmInstall = pkgSanitized || !lockPresent;
+  const useNpmInstall = pkgRepaired || pkgSanitized || !lockPresent;
   const headerExtra = [
+    pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
     pkgSanitized ? '[studio] скорректирован lucide-react в package.json; lock пересоздаётся' : null,
-    !lockPresent && !pkgSanitized ? '[studio] нет package-lock.json — выполняется npm install' : null,
+    !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
     .filter(Boolean)
     .join('\n');
@@ -1396,6 +1471,7 @@ function buildStudioJsonOpsPrompt({
 - Пути POSIX, без ".." и без ведущего /.
 - Не используй корни node_modules, dist, .git, .vite.
 - В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET).
+- Версии в dependencies: только печатные символы, без управляющих Unicode (иначе npm не прочитает package.json).
 ${headLine}
 
 Файлы в workspace (фрагмент списка):
@@ -1437,6 +1513,7 @@ function buildStudioBuildRecoveryPrompt({ headRevisionId, fileSummary, projectPl
 - Не трогай node_modules, dist, .git, .vite.
 - **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`.
 - Если не хватает lockfile — допусти правку только package.json; сервер сам выполнит npm install.
+- Строки версий в dependencies: только обычные printable-символы, **без** управляющих символов (0x00–0x1F).
 ${headLine}
 
 Файлы workspace:
