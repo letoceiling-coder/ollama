@@ -594,7 +594,14 @@ const STUDIO_NPM_LUCIDE_REACT = (process.env.STUDIO_NPM_LUCIDE_REACT || '^1.0.0'
 const STUDIO_NPM_PACKAGE_KEY_FIXES = {
   'tailwind-css': 'tailwindcss',
   tailwind_css: 'tailwindcss',
+  /** Галлюцинация LLM (пакета нет в registry). */
+  'react-reliable': 'react',
+  'react-reliabel': 'react',
+  'react-relyable': 'react',
 };
+/** Если модель указала несуществующую ветку framer-motion (напр. ^4.84.0). */
+const STUDIO_FRAMER_MOTION_FALLBACK =
+  (process.env.STUDIO_FRAMER_MOTION_FALLBACK || '^11.0.0').trim() || '^11.0.0';
 /** Если модель запросила несуществующий patch tailwind v3 (напр. ^3.12.1). */
 const STUDIO_TAILWIND_V3_FALLBACK = (process.env.STUDIO_TAILWIND_V3_FALLBACK || '^3.4.17').trim() || '^3.4.17';
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
@@ -743,6 +750,20 @@ function studioNormalizeLucideReactVersion(ver) {
   return s;
 }
 
+/** В линии v4 на npm есть только 4.0.x–4.1.x; ^4.84.0 и т.п. дают ETARGET. */
+function studioNormalizeFramerMotionVersion(ver) {
+  const s = studioScrubNpmVersionValue(ver);
+  if (!s) return s;
+  const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (m) {
+    const major = parseInt(m[1], 10);
+    const minor = parseInt(m[2], 10);
+    const patch = m[3] !== undefined ? parseInt(m[3], 10) : 0;
+    if (major === 4 && (minor > 1 || (minor === 1 && patch > 17))) return STUDIO_FRAMER_MOTION_FALLBACK;
+  }
+  return s;
+}
+
 function studioEnsurePackageScripts(pkg) {
   const tpl = studioReadTemplatePackageJson();
   if (!tpl || !tpl.scripts || typeof tpl.scripts !== 'object') return false;
@@ -814,6 +835,46 @@ function studioEnsureViteToolchain(pkg) {
     }
     if (pkg.dependencies && typeof pkg.dependencies[name] === 'string') {
       delete pkg.dependencies[name];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Vite + plugin-react без react/react-dom в dependencies → Rollup: cannot resolve "react-dom/client".
+ * Добавляет недостающие пакеты из studio-template; убирает их из devDependencies.
+ */
+function studioEnsureReactRuntimeDeps(pkg) {
+  const tpl = studioReadTemplatePackageJson();
+  if (!tpl?.dependencies || typeof tpl.dependencies !== 'object') return false;
+  const hasReactPlugin = Boolean(
+    pkg.devDependencies?.['@vitejs/plugin-react'] || pkg.dependencies?.['@vitejs/plugin-react'],
+  );
+  const hasReactish = Boolean(
+    pkg.dependencies?.react ||
+      pkg.devDependencies?.react ||
+      pkg.dependencies?.['react-dom'] ||
+      pkg.devDependencies?.['react-dom'],
+  );
+  const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
+  const scriptsStr = `${String(scripts.build || '')} ${String(scripts.dev || '')} ${String(scripts.preview || '')}`;
+  const usesVite = /\bvite\b/.test(scriptsStr);
+  const hasViteDep = Boolean(pkg.dependencies?.vite || pkg.devDependencies?.vite);
+  if (!hasReactPlugin && !(hasReactish && (usesVite || hasViteDep))) return false;
+
+  if (!pkg.dependencies || typeof pkg.dependencies !== 'object') pkg.dependencies = {};
+  let changed = false;
+  for (const name of ['react', 'react-dom']) {
+    const want = tpl.dependencies[name];
+    if (typeof want !== 'string' || !want.trim()) continue;
+    const cur = pkg.dependencies[name];
+    if (typeof cur !== 'string' || !studioScrubNpmVersionValue(cur)) {
+      pkg.dependencies[name] = want;
+      changed = true;
+    }
+    if (pkg.devDependencies && typeof pkg.devDependencies === 'object' && pkg.devDependencies[name]) {
+      delete pkg.devDependencies[name];
       changed = true;
     }
   }
@@ -960,6 +1021,13 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
       const fin = studioLucideReactRangeLooksInvalid(n) ? STUDIO_NPM_LUCIDE_REACT : n;
       if (fin !== o['lucide-react']) {
         o['lucide-react'] = fin;
+        changed = true;
+      }
+    }
+    if (typeof o['framer-motion'] === 'string') {
+      const n = studioNormalizeFramerMotionVersion(o['framer-motion']);
+      if (n && n !== o['framer-motion']) {
+        o['framer-motion'] = n;
         changed = true;
       }
     }
