@@ -20,6 +20,7 @@ ollama-api/data/users/*
 !ollama-api/data/users/.gitkeep
 # Studio: копии workspace пользователей; шаблон — только lock + исходники без node_modules в Git
 ollama-api/data/studio-workspaces/
+ollama-api/data/studio-revisions/
 ollama-api/studio-template/node_modules/
 ollama-api/studio-template/dist/
 

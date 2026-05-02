@@ -28,6 +28,8 @@ export interface StudioProject {
   lastBuild?: StudioLastBuild;
   /** Подписанная ссылка /preview/.../ для iframe и шаринга (TTL на сервере). */
   previewSharePath?: string | null;
+  /** Последняя зафиксированная ревизия (POST …/revisions); для PATCH workspace base_revision_id. */
+  headRevisionId?: string | null;
 }
 
 export interface StudioLastBuild {
@@ -54,3 +56,42 @@ export interface StudioFileContent {
   size: number;
   mtime: number;
 }
+
+export interface StudioRevisionSummary {
+  id: string;
+  parent_revision_id: string | null;
+  message: string;
+  createdAt: number;
+  archiveBytes: number;
+}
+
+/** §4.3 задача агента */
+export type StudioAgentTaskStatus =
+  | 'open'
+  | 'planning'
+  | 'awaiting_task_plan_approval'
+  | 'approved'
+  | 'implementing'
+  | 'done'
+  | 'error';
+
+export interface StudioTask {
+  id: string;
+  title: string;
+  prompt: string;
+  imagesCount: number;
+  status: StudioAgentTaskStatus;
+  planMarkdown: string;
+  activeRunId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** События SSE …/agent/stream/:runId */
+export type StudioAgentSse =
+  | { type: 'delta'; payload: { text?: string } }
+  | { type: 'plan_ready'; payload: { task_id?: string; markdown?: string } }
+  | { type: 'tool_start' | 'tool_end'; payload: Record<string, unknown> }
+  | { type: 'revision' | 'preview_url'; payload: Record<string, unknown> }
+  | { type: 'error'; payload: { message?: string; detail?: string } }
+  | { type: 'done'; payload: Record<string, unknown> };

@@ -145,6 +145,11 @@ function loadUserFile(userId) {
       if (typeof p.previewShareExpiresAt !== 'number' || !Number.isFinite(p.previewShareExpiresAt)) {
         delete p.previewShareExpiresAt;
       }
+      if (p.studioHeadRevisionId != null && !isUuidLike(String(p.studioHeadRevisionId))) {
+        delete p.studioHeadRevisionId;
+      }
+      normalizeStudioProjectTasks(p);
+      normalizeStudioAgentChat(p);
     }
     return raw;
   } catch {
@@ -550,9 +555,24 @@ const STUDIO_MAX_BUILDS_PER_USER = Math.max(1, Number(process.env.STUDIO_MAX_BUI
 const STUDIO_FILE_MAX_READ = Math.min(Number(process.env.STUDIO_FILE_MAX_READ || 1_500_000), 5_000_000);
 const STUDIO_FILE_MAX_WRITE = Math.min(Number(process.env.STUDIO_FILE_MAX_WRITE || 1_500_000), 5_000_000);
 const STUDIO_WORKSPACE_IGNORE = new Set(['node_modules', 'dist', '.git', '.vite', '.DS_Store']);
+const STUDIO_REVISIONS_ROOT = path.join(__dirname, 'data', 'studio-revisions');
+const STUDIO_REVISIONS_MAX_PER_PROJECT = Math.max(5, Number(process.env.STUDIO_REVISIONS_MAX_PER_PROJECT || 80));
+const STUDIO_WORKSPACE_PATCH_MAX_OPS = Math.max(1, Number(process.env.STUDIO_WORKSPACE_PATCH_MAX_OPS || 50));
+/** Лимит операций в одном ответе LLM при agent/implement (§6.1 pseudo-tool studio.patch_workspace). */
+const STUDIO_AGENT_IMPLEMENT_MAX_OPS = Math.max(
+  1,
+  Math.min(STUDIO_WORKSPACE_PATCH_MAX_OPS, Number(process.env.STUDIO_AGENT_IMPLEMENT_MAX_OPS || 15)),
+);
+const STUDIO_AGENT_CODE_MODEL = (process.env.STUDIO_AGENT_CODE_MODEL || 'deepseek-coder:latest').trim();
+/** Порядок облачных вызовов: см. STUDIO_LLM_ORDER_STREAM / STUDIO_LLM_ORDER_JSON / STUDIO_LLM_FALLBACK_ORDER в env. */
+const STUDIO_CLOUD_MAX_TOKENS = Math.min(
+  32768,
+  Math.max(512, Number(process.env.STUDIO_CLOUD_MAX_TOKENS || 8192)),
+);
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
+fs.mkdirSync(STUDIO_REVISIONS_ROOT, { recursive: true });
 
 /** @type {Set<string>} */
 const studioBuildInProgress = new Set();
@@ -625,6 +645,65 @@ function studioListWorkspaceFiles(wsRoot) {
   walk(path.resolve(wsRoot), '');
   out.sort((a, b) => a.path.localeCompare(b.path));
   return out.slice(0, 800);
+}
+
+function studioRevisionDir(userId, projectId) {
+  return path.join(STUDIO_REVISIONS_ROOT, userId, projectId);
+}
+
+function studioTarWorkspaceToFile(wsRoot, destGz) {
+  const ws = path.resolve(wsRoot);
+  const out = path.resolve(destGz);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  const r = spawnSync(
+    'tar',
+    ['-czf', out, '--exclude=node_modules', '--exclude=dist', '--exclude=.git', '-C', ws, '.'],
+    { encoding: 'utf8', maxBuffer: 10_000_000 },
+  );
+  if (r.status !== 0) {
+    const msg = (r.stderr || r.stdout || '').trim() || `tar exit ${r.status}`;
+    throw new Error(msg);
+  }
+}
+
+function studioReadRevisionMetaFile(fp) {
+  try {
+    return JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function studioListRevisionMetas(revDir) {
+  if (!fs.existsSync(revDir)) return [];
+  const names = fs.readdirSync(revDir).filter((n) => n.endsWith('.meta.json'));
+  const out = [];
+  for (const n of names) {
+    const m = studioReadRevisionMetaFile(path.join(revDir, n));
+    if (m && m.id) out.push(m);
+  }
+  out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return out;
+}
+
+/** Фаза 1: ограничение числа snapshотов на проект (старые meta+tar.gz удаляются). */
+function studioPruneOldRevisions(revDir) {
+  const metas = studioListRevisionMetas(revDir);
+  if (metas.length <= STUDIO_REVISIONS_MAX_PER_PROJECT) return;
+  const toRemove = metas.slice(STUDIO_REVISIONS_MAX_PER_PROJECT);
+  for (const m of toRemove) {
+    const arch = m.archiveFile || `${m.id}.tar.gz`;
+    try {
+      fs.unlinkSync(path.join(revDir, `${m.id}.meta.json`));
+    } catch {
+      /* */
+    }
+    try {
+      fs.unlinkSync(path.join(revDir, arch));
+    } catch {
+      /* */
+    }
+  }
 }
 
 /** Путь тома для `docker -v` (Windows → стиль /c/... для Docker Desktop). */
@@ -899,6 +978,12 @@ function enrichStudioProjectForClient(userId, project) {
   const exp = project.previewShareExpiresAt;
   const o = JSON.parse(JSON.stringify(project));
   delete o.previewShareExpiresAt;
+  o.headRevisionId =
+    project.studioHeadRevisionId && isUuidLike(String(project.studioHeadRevisionId))
+      ? project.studioHeadRevisionId
+      : null;
+  delete o.studioHeadRevisionId;
+  delete o.studioAgentChat;
   if (project.taskStatus === 'ready_for_review' && typeof exp === 'number' && exp > Date.now()) {
     o.previewSharePath = `/preview/${signStudioPreviewToken({ u: userId, p: project.id, e: exp })}/`;
   } else {
@@ -918,6 +1003,899 @@ function studioActiveBuildCountForUser(userId) {
     if (k.startsWith(prefix)) n += 1;
   }
   return n;
+}
+
+/** ---------- Studio §4.3: задачи, agent/run, SSE ---------- */
+
+const STUDIO_TASKS_MAX_PER_PROJECT = Math.max(10, Number(process.env.STUDIO_TASKS_MAX_PER_PROJECT || 200));
+const STUDIO_AGENT_MAX_RUNS_PER_USER = Math.max(1, Number(process.env.STUDIO_AGENT_MAX_RUNS_PER_USER || 3));
+const STUDIO_AGENT_CHAT_MAX_MESSAGES = Math.max(4, Number(process.env.STUDIO_AGENT_CHAT_MAX_MESSAGES || 40));
+
+const STUDIO_TASK_STATUSES = new Set([
+  'open',
+  'planning',
+  'awaiting_task_plan_approval',
+  'approved',
+  'implementing',
+  'done',
+  'error',
+]);
+
+/** @type {Map<string, { userId: string, projectId: string, taskId: string, mode: string, events: object[], subscribers: Set<import('http').ServerResponse>, done: boolean }>} */
+const studioAgentRuns = new Map();
+
+function normalizeStudioProjectTasks(project) {
+  if (!project || typeof project !== 'object') return;
+  if (!Array.isArray(project.tasks)) project.tasks = [];
+  const next = [];
+  for (const t of project.tasks) {
+    if (!t || typeof t !== 'object') continue;
+    if (!isUuidLike(String(t.id))) continue;
+    const status = STUDIO_TASK_STATUSES.has(t.status) ? t.status : 'open';
+    next.push({
+      id: t.id,
+      title: typeof t.title === 'string' ? t.title.slice(0, 200) : 'Задача',
+      prompt: typeof t.prompt === 'string' ? t.prompt.slice(0, 20_000) : '',
+      images: Array.isArray(t.images) ? t.images.filter((x) => typeof x === 'string').slice(0, 8) : [],
+      status,
+      planMarkdown: typeof t.planMarkdown === 'string' ? t.planMarkdown.slice(0, 80_000) : '',
+      activeRunId: t.activeRunId && isUuidLike(String(t.activeRunId)) ? t.activeRunId : null,
+      createdAt: typeof t.createdAt === 'number' ? t.createdAt : Date.now(),
+      updatedAt: typeof t.updatedAt === 'number' ? t.updatedAt : Date.now(),
+    });
+  }
+  project.tasks = next.slice(0, STUDIO_TASKS_MAX_PER_PROJECT);
+}
+
+function normalizeStudioAgentChat(project) {
+  if (!project || typeof project !== 'object') return;
+  if (!Array.isArray(project.studioAgentChat)) project.studioAgentChat = [];
+  const next = [];
+  for (const m of project.studioAgentChat) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const content = typeof m.content === 'string' ? m.content.slice(0, 16_000) : '';
+    if (!content.trim()) continue;
+    const entry = {
+      role,
+      content,
+      at: typeof m.at === 'number' ? m.at : Date.now(),
+    };
+    if (role === 'assistant' && Array.isArray(m.chips)) {
+      const chips = m.chips
+        .filter((x) => typeof x === 'string' && x.trim())
+        .slice(0, 6)
+        .map((x) => x.trim().slice(0, 240));
+      if (chips.length) entry.chips = chips;
+    }
+    next.push(entry);
+  }
+  project.studioAgentChat = next.slice(-STUDIO_AGENT_CHAT_MAX_MESSAGES);
+}
+
+function findStudioTask(project, taskId) {
+  if (!project || !Array.isArray(project.tasks)) return null;
+  return project.tasks.find((t) => t.id === taskId) || null;
+}
+
+function studioTasksForClient(project) {
+  normalizeStudioProjectTasks(project);
+  return project.tasks.map((t) => ({
+    id: t.id,
+    title: t.title,
+    prompt: t.prompt,
+    imagesCount: t.images.length,
+    status: t.status,
+    planMarkdown: t.planMarkdown || '',
+    activeRunId: t.activeRunId || null,
+    createdAt: t.createdAt,
+    updatedAt: t.updatedAt,
+  }));
+}
+
+function studioAgentActiveRunCountForUser(userId) {
+  let n = 0;
+  for (const r of studioAgentRuns.values()) {
+    if (r.userId === userId && !r.done) n += 1;
+  }
+  return n;
+}
+
+function taskHasActiveAgentRun(task) {
+  if (!task.activeRunId) return false;
+  const run = studioAgentRuns.get(task.activeRunId);
+  return !!(run && !run.done);
+}
+
+function emitStudioAgentEvent(runId, type, payload) {
+  const run = studioAgentRuns.get(runId);
+  if (!run) return;
+  const ev = { type, payload: payload && typeof payload === 'object' ? payload : {} };
+  run.events.push(ev);
+  const line = `data: ${JSON.stringify(ev)}\n\n`;
+  for (const res of run.subscribers) {
+    try {
+      if (!res.writableEnded) res.write(line);
+    } catch (_) {
+      /* */
+    }
+  }
+}
+
+function finishStudioAgentRun(runId) {
+  const run = studioAgentRuns.get(runId);
+  if (!run || run.done) return;
+  run.done = true;
+  emitStudioAgentEvent(runId, 'done', {});
+  for (const res of run.subscribers) {
+    try {
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    } catch (_) {
+      /* */
+    }
+  }
+  run.subscribers.clear();
+  setTimeout(() => studioAgentRuns.delete(runId), 60_000);
+}
+
+function buildStudioPlanModePrompt(title, userPrompt) {
+  return `Ты архитектор фронтенд-проекта (Vite, React, TypeScript). Составь структурированный план в Markdown: цели, экраны и компоненты, данные, шаги реализации, риски. Без приветствий и без блоков кода. Язык: русский.
+
+Название задачи: ${title}
+
+Описание:
+${userPrompt}`.trim();
+}
+
+function buildStudioImplementModePrompt(title, userPrompt, taskPlanMd, projectPlanMd) {
+  return `Ты ведущий разработчик. Кратко опиши в Markdown, какие файлы в Vite+React+TS проекте нужно создать или изменить и суть правок (без полного кода). Язык: русский.
+
+Задача: ${title}
+Запрос: ${userPrompt}
+
+Утверждённый план задачи:
+${taskPlanMd || '(нет)'}
+
+Согласованный план проекта:
+${projectPlanMd || '(нет)'}`.trim();
+}
+
+/** Диалог премиум-агента (без «задач» в UI): уточнения, chips, plan_markdown. */
+function buildStudioAgentChatPrompt(historyTranscript, latestUser) {
+  return `Ты lead product engineer **премиум-студии** уровня Lovable / v0: клиент получает готовый работающий продукт, а не черновик.
+
+Поведение:
+- Язык: **русский**, тон уверенный и тёплый, без воды и штампов.
+- Если неясны цели, аудитория, ключевые экраны, стиль или функциональность — задай один сжатый блок уточнения и заполни **chips** (2–4 коротких варианта, как кнопки выбора в Lovable).
+- Когда информации достаточно для реализации — заполни **plan_markdown**: продакшн-план (Цели, Аудитория, Экраны и сценарии, UX, Визуал и тон, Стек Vite+React+TS, Контент, SEO/доступность где уместно, Критерии приёмки, Риски). Пиши так, будто отдаёшь ТЗ студии **класса premium**.
+- Не предлагай пользователю создавать задачи, тикеты или «подзадачи» — веди диалог до готового ТЗ.
+- Не обещай то, что нельзя собрать на Vite+React+TS без бэкенда, если бэкенд не оговорён.
+
+Формат ответа: **только один JSON-объект** без markdown-ограждений и без текста снаружи:
+{"reply":"текст пользователю (markdown в строке разрешён)","chips":[],"plan_markdown":null}
+
+Правила JSON:
+- chips: [] если варианты не нужны; иначе 2–4 коротких строк.
+- plan_markdown: строка с полным планом или null, пока рано.
+
+История диалога:
+${historyTranscript || '(начало диалога)'}
+
+Текущее сообщение пользователя:
+${latestUser}`.trim();
+}
+
+function parseStudioAgentChatResponse(raw) {
+  const s = String(raw || '').trim();
+  const fallback = {
+    reply: s.length > 0 ? s : 'Не удалось разобрать ответ модели. Повторите сообщение.',
+    chips: [],
+    plan_markdown: null,
+  };
+  if (!s) return fallback;
+  let obj;
+  try {
+    obj = JSON.parse(s);
+  } catch {
+    const i = s.indexOf('{');
+    const j = s.lastIndexOf('}');
+    if (i === -1 || j <= i) return fallback;
+    try {
+      obj = JSON.parse(s.slice(i, j + 1));
+    } catch {
+      return fallback;
+    }
+  }
+  if (!obj || typeof obj !== 'object') return fallback;
+  const reply = typeof obj.reply === 'string' ? obj.reply.trim() : fallback.reply;
+  const chips = Array.isArray(obj.chips)
+    ? obj.chips
+        .filter((x) => typeof x === 'string' && x.trim())
+        .slice(0, 6)
+        .map((x) => x.trim().slice(0, 240))
+    : [];
+  const pm = obj.plan_markdown != null && typeof obj.plan_markdown === 'string' ? obj.plan_markdown.trim() : '';
+  const plan_markdown = pm.length >= 120 ? pm.slice(0, 50_000) : null;
+  return { reply, chips, plan_markdown };
+}
+
+function buildStudioJsonOpsPrompt({
+  title,
+  userPrompt,
+  taskPlan,
+  projectPlan,
+  narrative,
+  headRevisionId,
+  fileSummary,
+  maxOps,
+}) {
+  const headLine = headRevisionId
+    ? `Текущий HEAD ревизии workspace: ${headRevisionId}. Поле base_revision_id в JSON должно совпадать с этим UUID.`
+    : `Ревизий HEAD нет — укажи base_revision_id как пустую строку "".`;
+  return `Ты отвечаешь ТОЛЬКО одним JSON-объектом (без Markdown, без текста до или после, без \`\`\`).
+
+Формат:
+{"base_revision_id":"<uuid или пустая строка>","operations":[...]}
+
+Элементы operations (не больше ${maxOps}):
+- {"op":"write","path":"относительный/путь.ts","content_base64":"<base64 UTF-8 содержимого файла>"}
+- {"op":"delete","path":"путь"}
+- {"op":"mkdir","path":"каталог"}
+
+Правила:
+- Пути POSIX, без ".." и без ведущего /.
+- Не используй корни node_modules, dist, .git, .vite.
+${headLine}
+
+Файлы в workspace (фрагмент списка):
+${fileSummary}
+
+Название задачи: ${title}
+Запрос: ${userPrompt}
+
+План задачи (утверждён):
+${truncateChars(String(taskPlan || ''), 6000)}
+
+План проекта:
+${truncateChars(String(projectPlan || ''), 4000)}
+
+Резюме правок (из предыдущего ответа-модели):
+${truncateChars(String(narrative || ''), 8000)}
+
+Сгенерируй минимальный набор операций для Vite+React+TypeScript. Только JSON.`.trim();
+}
+
+function parseAgentWorkspaceOperations(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { ok: false, err: 'empty', operations: [], base_revision_id: null };
+  let obj;
+  try {
+    obj = JSON.parse(s);
+  } catch {
+    const i = s.indexOf('{');
+    const j = s.lastIndexOf('}');
+    if (i === -1 || j <= i) return { ok: false, err: 'json_parse', operations: [], base_revision_id: null };
+    try {
+      obj = JSON.parse(s.slice(i, j + 1));
+    } catch {
+      return { ok: false, err: 'json_parse', operations: [], base_revision_id: null };
+    }
+  }
+  if (!obj || typeof obj !== 'object' || !Array.isArray(obj.operations)) {
+    return { ok: false, err: 'bad_shape', operations: [], base_revision_id: null };
+  }
+  const base_revision_id =
+    obj.base_revision_id != null && String(obj.base_revision_id).trim().length > 0
+      ? String(obj.base_revision_id).trim()
+      : null;
+  return { ok: true, err: null, operations: obj.operations, base_revision_id };
+}
+
+/** Модели по ролям: стрим = связные планы; json = строгая схема PATCH workspace. */
+function studioStreamAnthropicModel() {
+  return String(
+    process.env.ANTHROPIC_MODEL_STREAM || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+  ).trim();
+}
+function studioJsonAnthropicModel() {
+  return String(
+    process.env.ANTHROPIC_MODEL_JSON || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+  ).trim();
+}
+function studioStreamOpenAiModel() {
+  return String(
+    process.env.OPENAI_STUDIO_MODEL_STREAM || process.env.OPENAI_STUDIO_MODEL || 'gpt-4o',
+  ).trim();
+}
+function studioJsonOpenAiModel() {
+  return String(
+    process.env.OPENAI_STUDIO_MODEL_JSON || process.env.OPENAI_STUDIO_MODEL || 'gpt-4o',
+  ).trim();
+}
+function studioStreamGeminiModel() {
+  return String(
+    process.env.GEMINI_STUDIO_MODEL_STREAM || process.env.GEMINI_STUDIO_MODEL || 'gemini-2.0-flash',
+  ).trim();
+}
+function studioJsonGeminiModel() {
+  return String(
+    process.env.GEMINI_STUDIO_MODEL_JSON || process.env.GEMINI_STUDIO_MODEL || 'gemini-2.0-flash',
+  ).trim();
+}
+
+/**
+ * Порядок облачных провайдеров под задачу.
+ * @param {'stream' | 'json' | 'chat'} purpose
+ */
+function studioLlmOrderForPurpose(purpose) {
+  if (purpose === 'json') {
+    const raw = process.env.STUDIO_LLM_ORDER_JSON || 'openai,anthropic,gemini';
+    return raw
+      .toLowerCase()
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  if (purpose === 'chat') {
+    const raw =
+      process.env.STUDIO_LLM_ORDER_CHAT ||
+      process.env.STUDIO_LLM_ORDER_STREAM ||
+      'anthropic,openai,gemini';
+    return raw
+      .toLowerCase()
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  const raw =
+    process.env.STUDIO_LLM_ORDER_STREAM ||
+    process.env.STUDIO_LLM_FALLBACK_ORDER ||
+    'anthropic,openai,gemini';
+  return raw
+    .toLowerCase()
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function studioLlmFallbackConfigured() {
+  if (process.env.ANTHROPIC_API_KEY?.trim()) return true;
+  if (process.env.OPENAI_API_KEY?.trim()) return true;
+  if ((process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY)?.trim()) return true;
+  return false;
+}
+
+/** Ollama доступен или настроен хотя бы один облачный провайдер для студии. */
+function studioLlmUpstreamAvailable() {
+  return ollamaHealthCached.status === 'ok' || studioLlmFallbackConfigured();
+}
+
+async function studioLlmAnthropicComplete(prompt, maxTokens, modelExplicit) {
+  const key = process.env.ANTHROPIC_API_KEY?.trim();
+  if (!key) return null;
+  const model = String(
+    modelExplicit ||
+      process.env.ANTHROPIC_MODEL ||
+      'claude-sonnet-4-20250514',
+  ).trim();
+  const mt = Math.min(maxTokens, 16384);
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: mt,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+    signal: AbortSignal.timeout(Math.min(OLLAMA_FETCH_TIMEOUT_MS * 4, 120000)),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((data.error && (data.error.message || data.error)) || `HTTP ${res.status}`);
+  }
+  const blocks = Array.isArray(data.content) ? data.content : [];
+  const text = blocks.map((c) => (c && c.type === 'text' ? String(c.text || '') : '')).join('');
+  return text.trim();
+}
+
+async function studioLlmOpenAiComplete(prompt, maxTokens, modelExplicit) {
+  const key = process.env.OPENAI_API_KEY?.trim();
+  if (!key) return null;
+  const model = String(
+    modelExplicit || process.env.OPENAI_STUDIO_MODEL || 'gpt-4o',
+  ).trim();
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: Math.min(maxTokens, 16384),
+      messages: [{ role: 'user', content: prompt }],
+    }),
+    signal: AbortSignal.timeout(Math.min(OLLAMA_FETCH_TIMEOUT_MS * 4, 120000)),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error?.message || `HTTP ${res.status}`);
+  }
+  return String(data.choices?.[0]?.message?.content || '').trim();
+}
+
+async function studioLlmGeminiComplete(prompt, maxTokens, modelExplicit) {
+  const key = (process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY || '').trim();
+  if (!key) return null;
+  const model = String(
+    modelExplicit || process.env.GEMINI_STUDIO_MODEL || 'gemini-2.0-flash',
+  ).trim();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: Math.min(maxTokens, 8192) },
+    }),
+    signal: AbortSignal.timeout(Math.min(OLLAMA_FETCH_TIMEOUT_MS * 4, 120000)),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error?.message || `HTTP ${res.status}`);
+  }
+  const parts = data.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  return parts.map((p) => (p && p.text ? String(p.text) : '')).join('').trim();
+}
+
+async function studioLlmCompleteCloud(prompt, maxTokens, purpose = 'stream') {
+  const order = studioLlmOrderForPurpose(purpose);
+  let lastErr = 'no_cloud_provider_configured';
+  for (const p of order) {
+    try {
+      if (p === 'anthropic' && process.env.ANTHROPIC_API_KEY?.trim()) {
+        const modelSel =
+          purpose === 'json' ? studioJsonAnthropicModel() : studioStreamAnthropicModel();
+        const t = await studioLlmAnthropicComplete(prompt, maxTokens, modelSel);
+        if (t != null) return { ok: true, text: t, provider: 'anthropic', model: modelSel };
+      } else if (p === 'openai' && process.env.OPENAI_API_KEY?.trim()) {
+        const modelSel = purpose === 'json' ? studioJsonOpenAiModel() : studioStreamOpenAiModel();
+        const t = await studioLlmOpenAiComplete(prompt, maxTokens, modelSel);
+        if (t != null) return { ok: true, text: t, provider: 'openai', model: modelSel };
+      } else if (
+        p === 'gemini' &&
+        (process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY)?.trim()
+      ) {
+        const modelSel = purpose === 'json' ? studioJsonGeminiModel() : studioStreamGeminiModel();
+        const t = await studioLlmGeminiComplete(prompt, maxTokens, modelSel);
+        if (t != null) return { ok: true, text: t, provider: 'gemini', model: modelSel };
+      }
+    } catch (e) {
+      lastErr = String(e.message || e);
+      logError(`STUDIO_LLM_CLOUD_${purpose}_${p} ${lastErr}`);
+    }
+  }
+  return { ok: false, text: '', err: lastErr, provider: null, model: null };
+}
+
+async function studioTryOllamaGenerateSingle(model, prompt) {
+  try {
+    const upstream = await fetchOllamaWithRetry(`${OLLAMA_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ model, prompt, stream: false }),
+    });
+    if (!upstream.ok) {
+      let t = '';
+      try {
+        t = await upstream.text();
+      } catch (_) {
+        /* */
+      }
+      const offline = upstream.status === 503 || upstream.status === 502;
+      return {
+        ok: false,
+        text: '',
+        err: offline ? 'OLLAMA_OFFLINE' : `upstream_${upstream.status}`,
+        detail: t.slice(0, 400),
+      };
+    }
+    const data = await upstream.json();
+    const errStr = ollamaErrorTextFromGenerateJson(data);
+    if (errStr) {
+      return {
+        ok: false,
+        text: '',
+        err: isOllamaOutOfMemoryMessage(errStr) ? 'MODEL_OUT_OF_MEMORY' : errStr,
+        detail: '',
+      };
+    }
+    return { ok: true, text: String(data.response || '').trim(), err: null, detail: '' };
+  } catch (e) {
+    return { ok: false, text: '', err: 'OLLAMA_OFFLINE', detail: String(e.message || e) };
+  }
+}
+
+/** Одноразовый ответ: Ollama при живом шлюзе, иначе облако (ключи только из env). */
+async function studioGenerateSingleResponse(model, prompt) {
+  if (ollamaHealthCached.status === 'ok') {
+    const o = await studioTryOllamaGenerateSingle(model, prompt);
+    if (o.ok) return { ...o, provider: 'ollama' };
+    const cloud = await studioLlmCompleteCloud(prompt, STUDIO_CLOUD_MAX_TOKENS, 'json');
+    if (cloud.ok) return { ok: true, text: cloud.text, err: null, detail: '', provider: cloud.provider };
+    return { ok: false, text: '', err: cloud.err || o.err, detail: o.detail, provider: null };
+  }
+  const cloud = await studioLlmCompleteCloud(prompt, STUDIO_CLOUD_MAX_TOKENS, 'json');
+  if (cloud.ok) return { ok: true, text: cloud.text, err: null, detail: '', provider: cloud.provider };
+  return { ok: false, text: '', err: cloud.err || 'LLM_UNAVAILABLE', detail: '', provider: null };
+}
+
+/** Связный текст (диалог агента, нарратив): Ollama или облако с моделями stream/chat. */
+async function studioGeneratePlainLlmText(model, prompt) {
+  if (ollamaHealthCached.status === 'ok') {
+    const o = await studioTryOllamaGenerateSingle(model, prompt);
+    if (o.ok) return { ok: true, text: o.text, err: null, detail: '', provider: 'ollama' };
+    const cloud = await studioLlmCompleteCloud(prompt, STUDIO_CLOUD_MAX_TOKENS, 'chat');
+    if (cloud.ok) return { ok: true, text: cloud.text, err: null, detail: '', provider: cloud.provider };
+    return { ok: false, text: '', err: cloud.err || o.err, detail: o.detail, provider: null };
+  }
+  const cloud = await studioLlmCompleteCloud(prompt, STUDIO_CLOUD_MAX_TOKENS, 'chat');
+  if (cloud.ok) return { ok: true, text: cloud.text, err: null, detail: '', provider: cloud.provider };
+  return { ok: false, text: '', err: cloud.err || 'LLM_UNAVAILABLE', detail: '', provider: null };
+}
+
+function studioAgentChatHistoryTranscript(project) {
+  normalizeStudioAgentChat(project);
+  return project.studioAgentChat
+    .map((m) => `${m.role === 'assistant' ? 'Ассистент' : 'Пользователь'}: ${m.content}`)
+    .join('\n\n');
+}
+
+function studioEmitCloudDeltas(runId, fullText) {
+  const chunk = 100;
+  for (let i = 0; i < fullText.length; i += chunk) {
+    emitStudioAgentEvent(runId, 'delta', { text: fullText.slice(i, i + chunk) });
+  }
+}
+
+async function pipeOllamaGenerateToStudioRun(runId, promptText, model, images) {
+  let effectivePrompt = promptText;
+  if (images && images.length > 0 && ollamaHealthCached.status !== 'ok') {
+    effectivePrompt = `${promptText}\n\n[Системное примечание: передано ${images.length} изображени(й); в облачном режиме анализ изображений недоступен — опирайся на текст.]`;
+  }
+
+  const tryStreamOllama = ollamaHealthCached.status === 'ok';
+  if (tryStreamOllama) {
+    const upstreamPayload = { model, prompt: effectivePrompt, stream: true };
+    if (images && images.length > 0) upstreamPayload.images = images;
+
+    let upstream;
+    try {
+      upstream = await fetchOllamaWithRetry(`${OLLAMA_URL}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(upstreamPayload),
+      });
+    } catch (err) {
+      logError(`STUDIO_AGENT_FETCH ${runId} ${err.stack || err.message}`);
+      upstream = null;
+    }
+
+    const cleanupUpstream = () => upstream && safeCancelFetchBody(upstream.body);
+
+    if (upstream && upstream.ok && upstream.body != null) {
+      const parts = [];
+      try {
+        const nodeReadable = Readable.fromWeb(upstream.body);
+        const rl = readline.createInterface({ input: nodeReadable, crlfDelay: Infinity });
+        try {
+          for await (const line of rl) {
+            const run = studioAgentRuns.get(runId);
+            if (!run || run.done) break;
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let piece = '';
+            try {
+              const parsed = JSON.parse(trimmed);
+              const errStr = ollamaErrorTextFromGenerateJson(parsed);
+              if (isOllamaOutOfMemoryMessage(errStr)) {
+                emitStudioAgentEvent(runId, 'error', { message: 'MODEL_OUT_OF_MEMORY' });
+                break;
+              }
+              if (parsed.response) piece = String(parsed.response);
+            } catch {
+              piece = trimmed;
+            }
+            if (piece) {
+              parts.push(piece);
+              emitStudioAgentEvent(runId, 'delta', { text: piece });
+            }
+          }
+        } finally {
+          rl.close();
+          try {
+            nodeReadable.destroy();
+          } catch (_) {
+            /* */
+          }
+          cleanupUpstream();
+        }
+      } catch (err) {
+        cleanupUpstream();
+        logError(`STUDIO_AGENT_PIPE ${runId} ${err.stack || err.message}`);
+        emitStudioAgentEvent(runId, 'error', { message: String(err.message || err) });
+        return { ok: false, fullText: parts.join('') };
+      }
+      return { ok: true, fullText: parts.join(''), provider: 'ollama' };
+    }
+
+    if (upstream) cleanupUpstream();
+  }
+
+  const cloud = await studioLlmCompleteCloud(effectivePrompt, STUDIO_CLOUD_MAX_TOKENS, 'stream');
+  if (!cloud.ok) {
+    emitStudioAgentEvent(runId, 'error', {
+      message: cloud.err || 'LLM_UNAVAILABLE',
+    });
+    return { ok: false, fullText: '', provider: null };
+  }
+  studioEmitCloudDeltas(runId, cloud.text);
+  return { ok: true, fullText: cloud.text, provider: cloud.provider };
+}
+
+async function executeStudioAgentRun(runId) {
+  const run = studioAgentRuns.get(runId);
+  if (!run) return;
+  const { userId, projectId, taskId, mode } = run;
+
+  let taskTitle = '';
+  let taskPrompt = '';
+  let taskImages = [];
+  let taskPlanMd = '';
+  let projPlanMd = '';
+  let found = false;
+
+  await userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) return;
+    normalizeStudioProjectTasks(project);
+    const task = findStudioTask(project, taskId);
+    if (!task) return;
+    found = true;
+    taskTitle = task.title;
+    taskPrompt = task.prompt;
+    taskImages = task.images || [];
+    taskPlanMd = typeof task.planMarkdown === 'string' ? task.planMarkdown : '';
+    projPlanMd = project.plan && typeof project.plan.markdown === 'string' ? project.plan.markdown : '';
+  });
+
+  if (!found) {
+    emitStudioAgentEvent(runId, 'error', { message: 'not_found' });
+    finishStudioAgentRun(runId);
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      const task = findStudioTask(project, taskId);
+      if (task && task.activeRunId === runId) {
+        task.activeRunId = null;
+        task.status = 'error';
+        task.updatedAt = Date.now();
+        saveUserFile(userId, data);
+      }
+    });
+    return;
+  }
+
+  let model = await resolveModel(DEFAULT_MODEL);
+  const upstreamPayloadImages = taskImages.length > 0 ? taskImages : undefined;
+  if (upstreamPayloadImages) {
+    try {
+      model = await resolveVisionModel(DEFAULT_MODEL);
+    } catch (_) {
+      model = DEFAULT_MODEL;
+    }
+  }
+
+  const pseudo = { stream: true, model, prompt: 'x' };
+  if (upstreamPayloadImages) pseudo.images = upstreamPayloadImages;
+  stripImagesIfUnsupported(pseudo, model);
+  const imagesEff = pseudo.images;
+
+  if (mode === 'plan') {
+    const promptText = buildStudioPlanModePrompt(taskTitle, taskPrompt);
+    const { ok, fullText } = await pipeOllamaGenerateToStudioRun(runId, promptText, pseudo.model, imagesEff);
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (!task) return;
+      if (task.activeRunId !== runId) return;
+      task.activeRunId = null;
+      task.updatedAt = Date.now();
+      if (!ok) {
+        task.status = 'error';
+        saveUserFile(userId, data);
+        return;
+      }
+      task.planMarkdown = fullText.slice(0, 80_000);
+      task.status = 'awaiting_task_plan_approval';
+      saveUserFile(userId, data);
+      emitStudioAgentEvent(runId, 'plan_ready', {
+        task_id: taskId,
+        markdown: task.planMarkdown,
+      });
+    });
+    finishStudioAgentRun(runId);
+    return;
+  }
+
+  const narrativePrompt = buildStudioImplementModePrompt(taskTitle, taskPrompt, taskPlanMd, projPlanMd);
+  emitStudioAgentEvent(runId, 'tool_start', { tool: 'llm_explanation' });
+  const { ok: narOk, fullText: narrative } = await pipeOllamaGenerateToStudioRun(
+    runId,
+    narrativePrompt,
+    pseudo.model,
+    imagesEff,
+  );
+  emitStudioAgentEvent(runId, 'tool_end', { tool: 'llm_explanation' });
+
+  if (!narOk) {
+    emitStudioAgentEvent(runId, 'error', { message: 'ollama_stream_failed' });
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (task && task.activeRunId === runId) {
+        task.activeRunId = null;
+        task.status = 'error';
+        task.updatedAt = Date.now();
+        saveUserFile(userId, data);
+      }
+    });
+    finishStudioAgentRun(runId);
+    return;
+  }
+
+  let headRev = null;
+  await userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (project && project.studioHeadRevisionId && isUuidLike(String(project.studioHeadRevisionId))) {
+      headRev = project.studioHeadRevisionId;
+    }
+  });
+
+  const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+  const files = studioListWorkspaceFiles(ws);
+  const fileSummary = files.slice(0, 60).map((f) => f.path).join('\n') || '(пусто)';
+
+  const jsonPrompt = buildStudioJsonOpsPrompt({
+    title: taskTitle,
+    userPrompt: taskPrompt,
+    taskPlan: taskPlanMd,
+    projectPlan: projPlanMd,
+    narrative,
+    headRevisionId: headRev,
+    fileSummary,
+    maxOps: STUDIO_AGENT_IMPLEMENT_MAX_OPS,
+  });
+
+  const codeModel = ALLOWED_SET.has(STUDIO_AGENT_CODE_MODEL)
+    ? STUDIO_AGENT_CODE_MODEL
+    : await resolveModel('deepseek-coder:latest');
+
+  emitStudioAgentEvent(runId, 'tool_start', { tool: 'studio.patch_workspace' });
+  const gen2 = await studioGenerateSingleResponse(codeModel, jsonPrompt);
+
+  if (!gen2.ok) {
+    emitStudioAgentEvent(runId, 'error', {
+      message: gen2.err || 'llm_json_failed',
+      detail: gen2.detail,
+    });
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (task && task.activeRunId === runId) {
+        task.activeRunId = null;
+        task.status = 'error';
+        task.updatedAt = Date.now();
+        saveUserFile(userId, data);
+      }
+    });
+    emitStudioAgentEvent(runId, 'tool_end', { tool: 'studio.patch_workspace' });
+    finishStudioAgentRun(runId);
+    return;
+  }
+
+  const parsed = parseAgentWorkspaceOperations(gen2.text);
+  if (!parsed.ok || parsed.operations.length === 0) {
+    emitStudioAgentEvent(runId, 'error', { message: parsed.err || 'bad_operations_json' });
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (task && task.activeRunId === runId) {
+        task.activeRunId = null;
+        task.status = 'error';
+        task.updatedAt = Date.now();
+        saveUserFile(userId, data);
+      }
+    });
+    emitStudioAgentEvent(runId, 'tool_end', { tool: 'studio.patch_workspace' });
+    finishStudioAgentRun(runId);
+    return;
+  }
+
+  const ops = parsed.operations.slice(0, STUDIO_AGENT_IMPLEMENT_MAX_OPS);
+  const bodyBase = headRev || parsed.base_revision_id || null;
+
+  const patchOut = await studioApplyWorkspacePatchTxn(userId, projectId, bodyBase, ops);
+
+  if (patchOut.code !== 200) {
+    emitStudioAgentEvent(runId, 'error', {
+      message: patchOut.err || 'patch_failed',
+      code: patchOut.code,
+      at: patchOut.at,
+      conflicts: patchOut.conflicts,
+    });
+    await userTxn(userId, async () => {
+      const data = loadUserFile(userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return;
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (task && task.activeRunId === runId) {
+        task.activeRunId = null;
+        task.status = 'error';
+        task.updatedAt = Date.now();
+        saveUserFile(userId, data);
+      }
+    });
+    emitStudioAgentEvent(runId, 'tool_end', { tool: 'studio.patch_workspace' });
+    finishStudioAgentRun(runId);
+    return;
+  }
+
+  emitStudioAgentEvent(runId, 'revision', {
+    applied: patchOut.applied,
+    revision_id: null,
+  });
+
+  await userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) return;
+    normalizeStudioProjectTasks(project);
+    const task = findStudioTask(project, taskId);
+    if (task && task.activeRunId === runId) {
+      task.activeRunId = null;
+      task.status = 'done';
+      task.updatedAt = Date.now();
+      saveUserFile(userId, data);
+    }
+  });
+
+  emitStudioAgentEvent(runId, 'tool_end', { tool: 'studio.patch_workspace' });
+  finishStudioAgentRun(runId);
 }
 
 function maskKey(key) {
@@ -1686,6 +2664,568 @@ app.put('/api/studio/projects/:projectId/files/content', (req, res) => {
   }
 });
 
+/** Фаза 1 (план §4.2): список снимков workspace. */
+app.get('/api/studio/projects/:projectId/revisions', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    if (!data.studioProjects.some((p) => p.id === projectId)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const revDir = studioRevisionDir(req.userId, projectId);
+    const metas = studioListRevisionMetas(revDir);
+    res.json({
+      revisions: metas.map((m) => ({
+        id: m.id,
+        parent_revision_id: m.parent_revision_id,
+        message: m.message,
+        createdAt: m.createdAt,
+        archiveBytes: m.archiveBytes,
+      })),
+    });
+  } catch (e) {
+    logError(`STUDIO_REVISIONS_GET ${req.userId} ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** Фаза 1: зафиксировать tar.gz снимок (без parent — корневой). */
+app.post('/api/studio/projects/:projectId/revisions', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const parentRaw = body.parent_revision_id;
+  const message = typeof body.message === 'string' ? body.message.slice(0, 500) : '';
+  if (parentRaw != null && String(parentRaw).trim().length && !isUuidLike(String(parentRaw))) {
+    res.status(400).json({ error: 'bad_parent_revision' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    if (!data.studioProjects.some((p) => p.id === projectId)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const revDir = studioRevisionDir(req.userId, projectId);
+    fs.mkdirSync(revDir, { recursive: true });
+    const parentId = parentRaw != null && String(parentRaw).trim().length ? String(parentRaw) : null;
+    if (parentId) {
+      const parentMeta = path.join(revDir, `${parentId}.meta.json`);
+      if (!fs.existsSync(parentMeta)) {
+        res.status(400).json({ error: 'parent_revision_not_found' });
+        return;
+      }
+    }
+    const ws = ensureStudioWorkspaceScaffold(req.userId, projectId);
+    const revId = crypto.randomUUID();
+    const archiveFile = `${revId}.tar.gz`;
+    const archivePath = path.join(revDir, archiveFile);
+    try {
+      studioTarWorkspaceToFile(ws, archivePath);
+    } catch (e) {
+      logError(`STUDIO_REVISION_TAR ${e.message}`);
+      try {
+        fs.unlinkSync(archivePath);
+      } catch (_) {
+        /* */
+      }
+      res.status(500).json({ error: 'archive_failed', detail: String(e.message || e) });
+      return;
+    }
+    let st;
+    try {
+      st = fs.statSync(archivePath);
+    } catch {
+      res.status(500).json({ error: 'archive_stat_failed' });
+      return;
+    }
+    const meta = {
+      id: revId,
+      parent_revision_id: parentId,
+      message,
+      createdAt: Date.now(),
+      archiveFile,
+      archiveBytes: st.size,
+    };
+    fs.writeFileSync(path.join(revDir, `${revId}.meta.json`), JSON.stringify(meta, null, 2), 'utf8');
+    studioPruneOldRevisions(revDir);
+    await userTxn(req.userId, async () => {
+      const d = loadUserFile(req.userId);
+      const p = d.studioProjects.find((x) => x.id === projectId);
+      if (!p) return;
+      p.studioHeadRevisionId = revId;
+      p.updatedAt = Date.now();
+      saveUserFile(req.userId, d);
+    });
+    logAccess(`STUDIO_REVISION_CREATE user=${req.userId} project=${projectId} rev=${revId}`);
+    res.status(201).json({ revision_id: revId });
+  } catch (e) {
+    logError(`STUDIO_REVISION_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/**
+ * Транзакция §4.2: применить operations (план проекта обязан быть approved).
+ */
+async function studioApplyWorkspacePatchTxn(userId, projectId, baseRevisionId, ops) {
+  return userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) return { code: 404 };
+    if (project.plan.status !== 'approved') return { code: 409, err: 'studio_plan_not_approved' };
+    const base = baseRevisionId;
+    if (
+      base != null &&
+      String(base).trim().length > 0 &&
+      project.studioHeadRevisionId &&
+      String(base) !== project.studioHeadRevisionId
+    ) {
+      return {
+        code: 409,
+        err: 'revision_conflict',
+        conflicts: [{ type: 'base_revision_id', expected: project.studioHeadRevisionId, got: String(base) }],
+      };
+    }
+    if (!Array.isArray(ops) || ops.length === 0) return { code: 400, err: 'no_operations' };
+    if (ops.length > STUDIO_WORKSPACE_PATCH_MAX_OPS) return { code: 400, err: 'too_many_operations' };
+    const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+    for (let i = 0; i < ops.length; i++) {
+      const op = ops[i];
+      if (!op || typeof op !== 'object') return { code: 400, err: 'bad_operation', at: i };
+      const kind = op.op;
+      if (kind === 'write') {
+        const rel = studioSanitizeRelativePath(op.path);
+        if (!rel) return { code: 400, err: 'bad_path', at: i };
+        if (typeof op.content_base64 !== 'string') return { code: 400, err: 'bad_content', at: i };
+        let buf;
+        try {
+          buf = Buffer.from(op.content_base64, 'base64');
+        } catch {
+          return { code: 400, err: 'bad_base64', at: i };
+        }
+        if (buf.length > STUDIO_FILE_MAX_WRITE) return { code: 413, err: 'file_too_large', at: i };
+        const parts = rel.split('/');
+        if (parts.length && STUDIO_WORKSPACE_IGNORE.has(parts[0])) return { code: 403, err: 'forbidden_path', at: i };
+        const fp = studioResolveWorkspacePath(ws, rel);
+        if (!fp) return { code: 400, err: 'bad_path', at: i };
+        fs.mkdirSync(path.dirname(fp), { recursive: true });
+        fs.writeFileSync(fp, buf);
+      } else if (kind === 'delete') {
+        const rel = studioSanitizeRelativePath(op.path);
+        if (!rel) return { code: 400, err: 'bad_path', at: i };
+        const parts = rel.split('/');
+        if (parts.length && STUDIO_WORKSPACE_IGNORE.has(parts[0])) return { code: 403, err: 'forbidden_path', at: i };
+        const fp = studioResolveWorkspacePath(ws, rel);
+        if (fp && fs.existsSync(fp)) fs.rmSync(fp, { force: true, recursive: true });
+      } else if (kind === 'mkdir') {
+        const rel = studioSanitizeRelativePath(op.path);
+        if (!rel) return { code: 400, err: 'bad_path', at: i };
+        const parts = rel.split('/');
+        if (parts.length && STUDIO_WORKSPACE_IGNORE.has(parts[0])) return { code: 403, err: 'forbidden_path', at: i };
+        const fp = studioResolveWorkspacePath(ws, rel);
+        if (!fp) return { code: 400, err: 'bad_path', at: i };
+        fs.mkdirSync(fp, { recursive: true });
+      } else {
+        return { code: 400, err: 'unknown_op', at: i, op: kind };
+      }
+    }
+    project.updatedAt = Date.now();
+    saveUserFile(userId, data);
+    logAccess(`STUDIO_WORKSPACE_PATCH user=${userId} project=${projectId} ops=${ops.length}`);
+    return { code: 200, applied: ops.length };
+  });
+}
+
+/**
+ * Фаза 1 (план §4.2): батч-операций в workspace. Только после согласования плана (§1.6).
+ * Ответ как в плане: `{ revision_id }` — новая ревизия не создаётся автоматически; вызовите POST …/revisions.
+ */
+app.patch('/api/studio/projects/:projectId/workspace', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const ops = body.operations;
+  try {
+    const out = await studioApplyWorkspacePatchTxn(req.userId, projectId, body.base_revision_id, ops);
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (out.code === 409) {
+      if (out.err === 'revision_conflict') {
+        res.status(409).json({ error: out.err, conflicts: out.conflicts });
+        return;
+      }
+      res.status(409).json({ error: out.err || 'conflict' });
+      return;
+    }
+    if (out.code === 400) {
+      res.status(400).json({ error: out.err || 'bad_request', at: out.at, op: out.op });
+      return;
+    }
+    if (out.code === 413) {
+      res.status(413).json({ error: out.err || 'file_too_large', at: out.at });
+      return;
+    }
+    res.status(200).json({ revision_id: null, applied: out.applied });
+  } catch (e) {
+    logError(`STUDIO_WORKSPACE_PATCH ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** §4.3: задачи проекта. */
+app.get('/api/studio/projects/:projectId/tasks', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    normalizeStudioProjectTasks(project);
+    res.json({ tasks: studioTasksForClient(project) });
+  } catch (e) {
+    logError(`STUDIO_TASKS_GET ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.post('/api/studio/projects/:projectId/tasks', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const titleRaw = typeof body.title === 'string' ? body.title.trim() : '';
+  const promptRaw = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const title = titleRaw.slice(0, 200) || 'Задача';
+  if (!promptRaw) {
+    res.status(400).json({ error: 'prompt_required' });
+    return;
+  }
+  const images = Array.isArray(body.images)
+    ? body.images.filter((x) => typeof x === 'string' && x.length > 0).slice(0, 8)
+    : [];
+  try {
+    const taskId = crypto.randomUUID();
+    await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) {
+        throw Object.assign(new Error('not_found'), { code: 404 });
+      }
+      normalizeStudioProjectTasks(project);
+      if (project.tasks.length >= STUDIO_TASKS_MAX_PER_PROJECT) {
+        throw Object.assign(new Error('tasks_limit'), { code: 400 });
+      }
+      const task = {
+        id: taskId,
+        title,
+        prompt: promptRaw.slice(0, 20_000),
+        images,
+        status: 'open',
+        planMarkdown: '',
+        activeRunId: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      project.tasks.push(task);
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+    });
+    logAccess(`STUDIO_TASK_CREATE user=${req.userId} project=${projectId} task=${taskId}`);
+    res.status(201).json({ task: { id: taskId, title, status: 'open' } });
+  } catch (e) {
+    if (e && e.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (e && e.code === 400) {
+      res.status(400).json({ error: 'tasks_limit' });
+      return;
+    }
+    logError(`STUDIO_TASKS_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.post('/api/studio/projects/:projectId/tasks/:taskId/approve-plan', async (req, res) => {
+  const projectId = req.params.projectId;
+  const taskId = req.params.taskId;
+  if (!isUuidLike(projectId) || !isUuidLike(taskId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const out = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (!task) return { code: 404 };
+      if (task.status !== 'awaiting_task_plan_approval') {
+        return { code: 409, err: 'task_plan_not_ready', status: task.status };
+      }
+      if (taskHasActiveAgentRun(task)) {
+        return { code: 409, err: 'task_agent_running' };
+      }
+      task.status = 'approved';
+      task.updatedAt = Date.now();
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      logAccess(`STUDIO_TASK_PLAN_APPROVE user=${req.userId} project=${projectId} task=${taskId}`);
+      return { task: JSON.parse(JSON.stringify(task)) };
+    });
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (out.code === 409) {
+      res.status(409).json({ error: out.err, taskStatus: out.status });
+      return;
+    }
+    res.json({
+      task: {
+        id: out.task.id,
+        title: out.task.title,
+        status: out.task.status,
+        planMarkdown: out.task.planMarkdown,
+      },
+    });
+  } catch (e) {
+    logError(`STUDIO_TASK_APPROVE ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** Чат премиум-агента (уточнения, chips, plan_markdown → план на согласование). */
+app.post('/api/studio/projects/:projectId/agent/chat', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const message = typeof body.message === 'string' ? body.message.trim() : '';
+  if (!message) {
+    res.status(400).json({ error: 'empty_message' });
+    return;
+  }
+  if (!studioLlmUpstreamAvailable()) {
+    res.status(503).json({ error: 'LLM_UNAVAILABLE', note: 'ollama_offline_no_cloud_keys' });
+    return;
+  }
+  try {
+    const first = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      normalizeStudioAgentChat(project);
+      return {
+        code: 200,
+        transcript: studioAgentChatHistoryTranscript(project),
+      };
+    });
+    if (first.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const prompt = buildStudioAgentChatPrompt(first.transcript, message.slice(0, 16_000));
+    const model = await resolveModel(DEFAULT_MODEL);
+    const gen = await studioGeneratePlainLlmText(model, prompt);
+    if (!gen.ok) {
+      res.status(503).json({ error: gen.err || 'llm_failed', detail: gen.detail });
+      return;
+    }
+    const parsed = parseStudioAgentChatResponse(gen.text);
+    const saved = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const p = data.studioProjects.find((x) => x.id === projectId);
+      if (!p) return { code: 404 };
+      normalizeStudioAgentChat(p);
+      const now = Date.now();
+      p.studioAgentChat.push({
+        role: 'user',
+        content: message.slice(0, 16_000),
+        at: now,
+      });
+      const assistantEntry = {
+        role: 'assistant',
+        content: parsed.reply.slice(0, 16_000),
+        at: now + 1,
+      };
+      if (parsed.chips && parsed.chips.length) assistantEntry.chips = parsed.chips;
+      p.studioAgentChat.push(assistantEntry);
+      normalizeStudioAgentChat(p);
+      let planUpdated = false;
+      if (parsed.plan_markdown && String(parsed.plan_markdown).trim().length >= 120) {
+        p.plan = {
+          markdown: String(parsed.plan_markdown).trim().slice(0, 50_000),
+          status: 'pending_approval',
+          updatedAt: Date.now(),
+        };
+        p.taskStatus = 'awaiting_user_approval';
+        planUpdated = true;
+      }
+      p.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      return {
+        code: 200,
+        planUpdated,
+        enriched: enrichStudioProjectForClient(req.userId, JSON.parse(JSON.stringify(p))),
+      };
+    });
+    if (saved.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    logAccess(`STUDIO_AGENT_CHAT user=${req.userId} project=${projectId} plan=${saved.planUpdated}`);
+    res.json({
+      reply: parsed.reply,
+      chips: parsed.chips,
+      plan_updated: saved.planUpdated,
+      project: saved.enriched,
+    });
+  } catch (e) {
+    logError(`STUDIO_AGENT_CHAT ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** §4.3: запуск агента (план или реализация после согласований). Ответ: { run_id }; стрим — GET …/agent/stream/:runId */
+app.post('/api/studio/projects/:projectId/agent/run', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const taskId = typeof body.task_id === 'string' ? body.task_id.trim() : '';
+  const mode = body.mode === 'implement' ? 'implement' : 'plan';
+  if (!isUuidLike(taskId)) {
+    res.status(400).json({ error: 'bad_task_id' });
+    return;
+  }
+  if (!studioLlmUpstreamAvailable()) {
+    res.status(503).json({ error: 'LLM_UNAVAILABLE', note: 'ollama_offline_no_cloud_keys' });
+    return;
+  }
+  if (studioAgentActiveRunCountForUser(req.userId) >= STUDIO_AGENT_MAX_RUNS_PER_USER) {
+    res.status(429).json({ error: 'studio_agent_runs_limit' });
+    return;
+  }
+  try {
+    const out = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      normalizeStudioProjectTasks(project);
+      const task = findStudioTask(project, taskId);
+      if (!task) return { code: 404 };
+      if (taskHasActiveAgentRun(task)) {
+        return { code: 409, err: 'task_agent_running' };
+      }
+      if (mode === 'plan') {
+        const okStates = new Set(['open', 'error', 'awaiting_task_plan_approval']);
+        if (!okStates.has(task.status)) {
+          return { code: 409, err: 'bad_task_state_for_plan', taskStatus: task.status };
+        }
+      } else {
+        if (task.status !== 'approved') {
+          return { code: 409, err: 'task_not_approved', taskStatus: task.status };
+        }
+        if (project.plan.status !== 'approved') {
+          return { code: 409, err: 'project_plan_not_approved' };
+        }
+      }
+      const runId = crypto.randomUUID();
+      studioAgentRuns.set(runId, {
+        userId: req.userId,
+        projectId,
+        taskId,
+        mode,
+        events: [],
+        subscribers: new Set(),
+        done: false,
+      });
+      task.activeRunId = runId;
+      task.status = mode === 'plan' ? 'planning' : 'implementing';
+      task.updatedAt = Date.now();
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      return { runId };
+    });
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (out.code === 409) {
+      res.status(409).json({ error: out.err, taskStatus: out.taskStatus });
+      return;
+    }
+    logAccess(`STUDIO_AGENT_RUN user=${req.userId} project=${projectId} run=${out.runId} mode=${mode}`);
+    res.status(202).json({ run_id: out.runId });
+    setImmediate(() => {
+      void executeStudioAgentRun(out.runId);
+    });
+  } catch (e) {
+    logError(`STUDIO_AGENT_RUN_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.get('/api/studio/projects/:projectId/agent/stream/:runId', (req, res) => {
+  const projectId = req.params.projectId;
+  const runId = req.params.runId;
+  if (!isUuidLike(projectId) || !isUuidLike(runId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const run = studioAgentRuns.get(runId);
+  if (!run || run.userId !== req.userId || run.projectId !== projectId) {
+    res.status(404).json({ error: 'not_found' });
+    return;
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.flushHeaders?.();
+  for (const ev of run.events) {
+    res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  }
+  if (run.done) {
+    res.write('data: [DONE]\n\n');
+    res.end();
+    return;
+  }
+  run.subscribers.add(res);
+  req.on('close', () => {
+    run.subscribers.delete(res);
+  });
+});
+
 /** Черновик плана (агент или заглушка). status в теле: draft → правка без ожидания апрува; иначе → pending_approval */
 app.post('/api/studio/projects/:projectId/plan', async (req, res) => {
   const projectId = req.params.projectId;
@@ -1764,6 +3304,124 @@ app.post('/api/studio/projects/:projectId/plan/approve', async (req, res) => {
     res.json({ project: enrichStudioProjectForClient(req.userId, out.project) });
   } catch (e) {
     logError(`STUDIO_PLAN_APPROVE ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** После approve плана: один LLM-проход (нарратив + JSON ops) и PATCH workspace. */
+app.post('/api/studio/projects/:projectId/agent/apply-approved-plan', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  if (!studioLlmUpstreamAvailable()) {
+    res.status(503).json({ error: 'LLM_UNAVAILABLE' });
+    return;
+  }
+  try {
+    const peek = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      if (project.plan.status !== 'approved') {
+        return { code: 409, err: 'plan_not_approved', planStatus: project.plan.status };
+      }
+      const headRev =
+        project.studioHeadRevisionId && isUuidLike(String(project.studioHeadRevisionId))
+          ? project.studioHeadRevisionId
+          : null;
+      return {
+        code: 200,
+        headRev,
+        projPlanMd: typeof project.plan.markdown === 'string' ? project.plan.markdown : '',
+        projectName: typeof project.name === 'string' ? project.name : 'Проект',
+      };
+    });
+    if (peek.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (peek.code === 409) {
+      res.status(409).json({ error: peek.err, planStatus: peek.planStatus });
+      return;
+    }
+    let ws;
+    try {
+      ws = ensureStudioWorkspaceScaffold(req.userId, projectId);
+    } catch (e) {
+      if (String(e.message || e) === 'studio_template_missing') {
+        res.status(500).json({ error: 'studio_template_missing' });
+        return;
+      }
+      throw e;
+    }
+    const files = studioListWorkspaceFiles(ws);
+    const fileSummary = files.slice(0, 60).map((f) => f.path).join('\n') || '(пусто)';
+    const model = await resolveModel(DEFAULT_MODEL);
+    const narrativePrompt = buildStudioImplementModePrompt(
+      peek.projectName,
+      'Реализуй согласованный план проекта в workspace: полноценный интерфейс Vite+React+TypeScript премиум-качества, готовый к production-сборке.',
+      '',
+      peek.projPlanMd,
+    );
+    const nar = await studioGeneratePlainLlmText(model, narrativePrompt);
+    if (!nar.ok) {
+      res.status(503).json({ error: nar.err || 'llm_narrative_failed' });
+      return;
+    }
+    const jsonPrompt = buildStudioJsonOpsPrompt({
+      title: peek.projectName,
+      userPrompt:
+        'Соблюдай согласованный план проекта; реализуй UI, состояния, типографику и микровзаимодействия на уровне готового продукта.',
+      taskPlan: '',
+      projectPlan: peek.projPlanMd,
+      narrative: nar.text,
+      headRevisionId: peek.headRev,
+      fileSummary,
+      maxOps: STUDIO_AGENT_IMPLEMENT_MAX_OPS,
+    });
+    const codeModel = ALLOWED_SET.has(STUDIO_AGENT_CODE_MODEL)
+      ? STUDIO_AGENT_CODE_MODEL
+      : await resolveModel('deepseek-coder:latest');
+    const gen2 = await studioGenerateSingleResponse(codeModel, jsonPrompt);
+    if (!gen2.ok) {
+      res.status(503).json({ error: gen2.err || 'llm_json_failed', detail: gen2.detail });
+      return;
+    }
+    const parsed = parseAgentWorkspaceOperations(gen2.text);
+    if (!parsed.ok || parsed.operations.length === 0) {
+      res.status(400).json({ error: parsed.err || 'bad_operations_json' });
+      return;
+    }
+    const ops = parsed.operations.slice(0, STUDIO_AGENT_IMPLEMENT_MAX_OPS);
+    const bodyBase = peek.headRev || parsed.base_revision_id || null;
+    const patchOut = await studioApplyWorkspacePatchTxn(req.userId, projectId, bodyBase, ops);
+    if (patchOut.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (patchOut.code === 409) {
+      res.status(409).json({
+        error: patchOut.err || 'patch_conflict',
+        conflicts: patchOut.conflicts,
+      });
+      return;
+    }
+    if (patchOut.code === 400) {
+      res.status(400).json({ error: patchOut.err || 'bad_request', at: patchOut.at, op: patchOut.op });
+      return;
+    }
+    if (patchOut.code === 413) {
+      res.status(413).json({ error: patchOut.err || 'file_too_large', at: patchOut.at });
+      return;
+    }
+    logAccess(
+      `STUDIO_APPLY_APPROVED_PLAN user=${req.userId} project=${projectId} applied=${patchOut.applied}`,
+    );
+    res.status(200).json({ applied: patchOut.applied, revision_id: null });
+  } catch (e) {
+    logError(`STUDIO_APPLY_APPROVED_PLAN ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
   }
 });

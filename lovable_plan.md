@@ -167,7 +167,9 @@
 | GET | `/api/studio/projects/:id/files` | дерево или flat-list текущей HEAD ревизии |
 | GET | `/api/studio/projects/:id/files/**path` | содержимое файла |
 | PUT | `/api/studio/projects/:id/files/**path` | записать файл (с optimistic locking `rev`/`etag`) |
+| GET | `/api/studio/projects/:id/revisions` | список снимков (meta: id, parent, message, размер архива) |
 | POST | `/api/studio/projects/:id/revisions` | зафиксировать снимок `{ parent_revision_id?, message }` |
+| PATCH | `/api/studio/projects/:id/workspace` | правки пачкой: `{ base_revision_id?, operations: [...] }` (после approve плана) |
 
 Для больших правок агента предпочтительнее **один PATCH**:
 
@@ -469,6 +471,7 @@ SPA маршрут `/lovable`, статический каркас UI.
 
 - CRUD проектов, шаблон `vite-react-ts` из архива.
 - Загрузка/чтение файлов через API (**реализовано:** `GET/PUT …/files`, `GET …/files/content`).
+- **§4.2 ревизии и workspace** (**реализовано:** `GET/POST …/revisions`, tar.gz + meta; `PATCH …/workspace` с проверкой `base_revision_id` / head и только при `plan.status === 'approved'`; UI — блок «Ревизии», снимок, HEAD).
 - Ручное редактирование одного файла в UI (опционально) — **в `/lovable` список файлов + редактор**.
 
 ### Фаза 2 — runner static preview
@@ -479,10 +482,10 @@ SPA маршрут `/lovable`, статический каркас UI.
 
 ### Фаза 3 — агент
 
-- Интеграция tool-calling с существующим LLM gateway.
-- SSE стрим в UI.
-- Задачи `StudioTask` + история.
-- Включить **фазу планирования** (план в чате или structured payload) до массовых правок файлов.
+- Интеграция tool-calling с существующим LLM gateway (**частично:** стрим + нативный tool API Ollama — следующий шаг; **есть:** оркестрация `implement` → JSON-операции → тот же `PATCH workspace`, события SSE `tool_start` / `tool_end` / `revision`).
+- SSE стрим в UI (**реализовано:** `POST …/agent/run`, `GET …/agent/stream/:runId`, события `delta`, `plan_ready`, `error`, `done`; LLM через существующий Ollama `/api/generate` stream).
+- Задачи `StudioTask` + история (**реализовано:** `GET/POST …/tasks`, `POST …/tasks/:taskId/approve-plan`; UI блок «Задачи §4.3»).
+- Включить **фазу планирования** до массовых правок файлов (**реализовано:** режим `plan` у `agent/run`; **`implement`** после апрувов: пояснение в потоке + второй вызов модели с JSON → `studioApplyWorkspacePatchTxn`, до `STUDIO_AGENT_IMPLEMENT_MAX_OPS` операций).
 
 ### Фаза 4 — качество и «премиум-пайплайн»
 

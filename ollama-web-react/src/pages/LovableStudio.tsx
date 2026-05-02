@@ -7,14 +7,16 @@ import {
   getStudioFileContent,
   getStudioProject,
   getStudioProjects,
+  getStudioRevisions,
   getStudioWorkspaceFiles,
-  postStudioPlan,
+  postStudioAgentChat,
+  postStudioApplyApprovedPlan,
   postStudioPreviewBuild,
+  postStudioRevision,
   putStudioFileContent,
   studioPreviewUrl,
 } from '../api/studioClient';
 import type { StudioProject } from '../api/studioTypes';
-import { buildPlanOutlineFromUserPrompt } from '../studio/planOutline';
 
 /** Запланированные возможности — roadmap UI */
 const AGENT_TOOLCHAIN = [
@@ -29,6 +31,8 @@ interface ChatTurn {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  /** Варианты ответа в стиле Lovable (показ под сообщением). */
+  chips?: string[];
 }
 
 const DEMO_PREVIEW_HTML = `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Превью</title><style>
@@ -67,11 +71,12 @@ export function LovableStudio() {
       id: 'w',
       role: 'agent',
       content:
-        'Опишите сайт или приложение. Я составлю **план** и отправлю его на ваше согласование. После «Согласовать и запустить» будет запущена реализация и сборка (runner подключается на следующей фазе).',
+        'Напишите, **какой продукт** вы хотите получить: для кого он, какие экраны и настроение. Я задам короткие уточнения и предложу варианты выбора — как в Lovable. Когда всё ясно, подготовлю **премиальное ТЗ** и план на ваше согласование; после согласования перенесём его в код и соберём превью. Никаких ручных «задач» — только диалог и результат.',
     },
   ]);
   const [draft, setDraft] = useState('');
   const [flowError, setFlowError] = useState<string | null>(null);
+  const [quickChips, setQuickChips] = useState<string[]>([]);
 
   const projectsQuery = useQuery({
     queryKey: QK.projects,
@@ -105,38 +110,45 @@ export function LovableStudio() {
 
   const project = projectQuery.data;
 
-  const postPlanMu = useMutation({
-    mutationFn: ({ id, md }: { id: string; md: string }) => postStudioPlan(id, md, 'pending_approval'),
-    onSuccess: (_, { md }) => {
+  const chatMu = useMutation({
+    mutationFn: ({ id, text }: { id: string; text: string }) => postStudioAgentChat(id, { message: text }),
+    onSuccess: (data, { id }) => {
+      void queryClient.setQueryData(QK.project(id), data.project);
       void queryClient.invalidateQueries({ queryKey: QK.projects });
-      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'files', id] });
+      setQuickChips(data.chips?.length ? data.chips : []);
       setMessages((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
           role: 'agent',
-          content:
-            'План сохранён и отправлен на **согласование**. Проверьте блок слева и нажмите «Согласовать и запустить», когда готовы.\n\n---\n' +
-            md.slice(0, 1200) +
-            (md.length > 1200 ? '\n…' : ''),
+          content: data.reply,
+          chips: data.chips?.length ? data.chips : undefined,
         },
       ]);
+      setFlowError(null);
     },
     onError: (e: Error) => setFlowError(e.message),
   });
 
-  const approveMu = useMutation({
-    mutationFn: (id: string) => approveStudioPlan(id),
-    onSuccess: () => {
+  const approveAndApplyMu = useMutation({
+    mutationFn: async (id: string) => {
+      await approveStudioPlan(id);
+      await postStudioApplyApprovedPlan(id);
+    },
+    onSuccess: (_, id) => {
       void queryClient.invalidateQueries({ queryKey: QK.projects });
-      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      void queryClient.invalidateQueries({ queryKey: QK.project(id) });
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'files', id] });
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'revisions', id] });
+      setFlowError(null);
       setMessages((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
           role: 'agent',
           content:
-            'План **согласован**. Нажмите **Собрать превью** слева: шаблон Vite в workspace, `npm ci` и `npm run build`; готовый билд откроется в превью.',
+            'План **согласован** и перенесён в **файлы проекта**. Нажмите **Собрать превью**, чтобы открыть собранный интерфейс.',
         },
       ]);
     },
@@ -172,12 +184,25 @@ export function LovableStudio() {
     setFlowError(null);
     const text = draft.trim();
     if (!text || !projectId) return;
-    const md = buildPlanOutlineFromUserPrompt(text);
-    const uid = () => crypto.randomUUID();
-    setMessages((prev) => [...prev, { id: uid(), role: 'user', content: text }]);
+    const uid = crypto.randomUUID();
+    setMessages((prev) => [...prev, { id: uid, role: 'user', content: text }]);
     setDraft('');
-    postPlanMu.mutate({ id: projectId, md });
-  }, [draft, projectId, postPlanMu]);
+    setQuickChips([]);
+    chatMu.mutate({ id: projectId, text });
+  }, [draft, projectId, chatMu]);
+
+  const sendChip = useCallback(
+    (label: string) => {
+      const t = label.trim();
+      if (!t || !projectId || chatMu.isPending || approveAndApplyMu.isPending) return;
+      setFlowError(null);
+      const uid = crypto.randomUUID();
+      setMessages((prev) => [...prev, { id: uid, role: 'user', content: t }]);
+      setQuickChips([]);
+      chatMu.mutate({ id: projectId, text: t });
+    },
+    [projectId, chatMu, approveAndApplyMu.isPending],
+  );
 
   const [editorDraft, setEditorDraft] = useState('');
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
@@ -186,6 +211,22 @@ export function LovableStudio() {
     queryKey: ['studio', 'files', projectId],
     queryFn: () => getStudioWorkspaceFiles(projectId!),
     enabled: !!projectId,
+  });
+
+  const revisionsQuery = useQuery({
+    queryKey: ['studio', 'revisions', projectId],
+    queryFn: () => getStudioRevisions(projectId!),
+    enabled: !!projectId,
+  });
+
+  const revisionMu = useMutation({
+    mutationFn: () => postStudioRevision(projectId!, { message: 'Снимок вручную из студии' }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'revisions', projectId] });
+      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      setFlowError(null);
+    },
+    onError: (e: Error) => setFlowError(e.message),
   });
 
   const fileContentQuery = useQuery({
@@ -222,11 +263,12 @@ export function LovableStudio() {
   });
 
   const busy =
-    postPlanMu.isPending ||
-    approveMu.isPending ||
+    chatMu.isPending ||
+    approveAndApplyMu.isPending ||
     createProjectMu.isPending ||
     buildMu.isPending ||
-    saveFileMu.isPending;
+    saveFileMu.isPending ||
+    revisionMu.isPending;
 
   const iframeRealSrc =
     project?.taskStatus === 'ready_for_review' && projectId
@@ -320,10 +362,12 @@ export function LovableStudio() {
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={() => projectId && approveMu.mutate(projectId)}
+                    onClick={() => projectId && approveAndApplyMu.mutate(projectId)}
                     className="mt-3 w-full rounded-lg border border-accent/40 bg-accent/25 py-2 text-sm font-medium text-white transition hover:bg-accent/35 disabled:opacity-40"
                   >
-                    Согласовать и запустить
+                    {approveAndApplyMu.isPending
+                      ? 'Применяем план к коду…'
+                      : 'Согласовать и применить к проекту'}
                   </button>
                 ) : null}
                 {project.plan.status === 'approved' ? (
@@ -359,7 +403,8 @@ export function LovableStudio() {
               </div>
             ) : (
               <p className="mt-2 text-[12px] text-zinc-500">
-                Отправьте описание в чат справа — появится черновой план и кнопка согласования.
+                Появится после того, как агент в чате справа подготовит ТЗ. До этого задавайте вопросы и выбирайте
+                варианты — без ручных «задач».
               </p>
             )}
 
@@ -433,6 +478,41 @@ export function LovableStudio() {
                 )}
               </div>
             )}
+
+            <p className="mt-6 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+              Ревизии (план §4.2)
+            </p>
+            {projectId && project ? (
+              <div className="mt-2 space-y-2">
+                <p className="break-all font-mono text-[10px] text-zinc-500">
+                  HEAD:{' '}
+                  {project.headRevisionId ? `${project.headRevisionId.slice(0, 8)}…` : '—'}
+                </p>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => revisionMu.mutate()}
+                  className="w-full rounded-md border border-amber-500/35 bg-amber-500/10 py-1.5 text-[11px] font-medium text-amber-100 hover:bg-amber-500/20 disabled:opacity-40"
+                >
+                  Снимок workspace (tar.gz)
+                </button>
+                {revisionsQuery.isLoading ? (
+                  <p className="text-[11px] text-zinc-500">Загрузка ревизий…</p>
+                ) : revisionsQuery.isError ? (
+                  <p className="text-[11px] text-red-300">Не удалось загрузить ревизии</p>
+                ) : (
+                  <ul className="scrollbar-thin max-h-28 list-none space-y-1 overflow-y-auto text-[10px] text-zinc-400">
+                    {(revisionsQuery.data || []).map((r) => (
+                      <li key={r.id} className="truncate rounded bg-white/[0.04] px-2 py-1">
+                        {new Date(r.createdAt).toLocaleString('ru-RU')} ·{' '}
+                        {(r.archiveBytes / 1024).toFixed(1)} KiB
+                        {r.message ? ` · ${r.message}` : ''}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : null}
           </div>
         </aside>
 
@@ -473,7 +553,7 @@ export function LovableStudio() {
         <aside className="flex max-h-[46vh] min-h-[200px] shrink-0 flex-col bg-black/25 lg:h-auto lg:max-h-none lg:w-[min(100%,380px)] lg:border-l lg:border-white/[0.06]">
           <div className="border-b border-white/[0.06] px-4 py-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Запрос · план
+              Диалог с агентом
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               {['Лендинг SaaS', 'Портфолио', 'Dashboard'].map((s) => (
@@ -505,11 +585,44 @@ export function LovableStudio() {
                   {m.role === 'user' ? 'Вы' : 'Агент'}
                 </span>
                 <p className="whitespace-pre-wrap">{m.content}</p>
+                {m.role === 'agent' && m.chips && m.chips.length ? (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {m.chips.map((c, idx) => (
+                      <button
+                        key={`${m.id}-c-${idx}`}
+                        type="button"
+                        disabled={busy}
+                        onClick={() => sendChip(c)}
+                        className="rounded-full border border-white/15 bg-white/[0.06] px-2 py-0.5 text-[11px] text-zinc-200 transition hover:border-accent/35 hover:bg-accent/15 disabled:opacity-40"
+                      >
+                        {c}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
 
           <div className="border-t border-white/[0.06] p-3">
+            {quickChips.length ? (
+              <div className="mb-2 flex flex-wrap gap-1.5">
+                <span className="w-full text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+                  Варианты
+                </span>
+                {quickChips.map((c, idx) => (
+                  <button
+                    key={`q-${idx}`}
+                    type="button"
+                    disabled={busy}
+                    onClick={() => sendChip(c)}
+                    className="rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1 text-[11px] text-emerald-100 transition hover:bg-accent/20 disabled:opacity-40"
+                  >
+                    {c}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
@@ -530,7 +643,7 @@ export function LovableStudio() {
               disabled={!projectId || busy}
               className="mt-2 w-full rounded-xl border border-accent/35 bg-accent/20 py-2.5 text-sm font-medium text-white shadow-lg shadow-black/25 transition hover:bg-accent/30 active:scale-[0.99] disabled:opacity-40"
             >
-              {postPlanMu.isPending ? 'Отправка плана…' : 'Составить план и отправить на согласование'}
+              {chatMu.isPending ? 'Агент отвечает…' : 'Отправить'}
             </button>
           </div>
         </aside>
