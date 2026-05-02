@@ -574,6 +574,8 @@ const STUDIO_CLOUD_MAX_TOKENS = Math.min(
   32768,
   Math.max(512, Number(process.env.STUDIO_CLOUD_MAX_TOKENS || 8192)),
 );
+/** Диапазон для lucide-react, если модель указала несуществующий (типично ^0.5.0). */
+const STUDIO_NPM_LUCIDE_REACT = (process.env.STUDIO_NPM_LUCIDE_REACT || '^1.0.0').trim() || '^1.0.0';
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
@@ -606,6 +608,60 @@ function ensureStudioWorkspaceScaffold(userId, projectId) {
     },
   });
   return ws;
+}
+
+/**
+ * У lucide-react версии вида 0.4xx/0.5xx; диапазон ^0.5.0 в semver означает <0.6.0 и даёт пустое множество на npm (ETARGET).
+ */
+function studioLucideReactRangeLooksInvalid(range) {
+  const raw = String(range || '').trim();
+  if (!raw) return true;
+  const v = raw.replace(/^(\^|~|>=|>|<=|<|=|\s)+/, '');
+  if (/^0\.5\./.test(v)) return true;
+  const m = /^0\.(\d+)\./.exec(v);
+  if (m) {
+    const minor = parseInt(m[1], 10);
+    if (minor > 0 && minor < 100) return true;
+  }
+  return false;
+}
+
+/**
+ * Исправляет типичные галлюцинации в package.json перед npm ci/install. Возвращает true, если lockfile нужно пересобрать.
+ */
+function studioSanitizeWorkspacePackageJson(wsRoot) {
+  const fp = path.join(wsRoot, 'package.json');
+  if (!fs.existsSync(fp)) return false;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (!pkg || typeof pkg !== 'object') return false;
+  const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+  let changed = false;
+  for (const sec of sections) {
+    const o = pkg[sec];
+    if (!o || typeof o !== 'object') continue;
+    if (typeof o['lucide-react'] !== 'string') continue;
+    const cur = o['lucide-react'];
+    if (studioLucideReactRangeLooksInvalid(cur)) {
+      o['lucide-react'] = STUDIO_NPM_LUCIDE_REACT;
+      changed = true;
+    }
+  }
+  if (changed) {
+    fs.writeFileSync(fp, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+    const lock = path.join(wsRoot, 'package-lock.json');
+    try {
+      if (fs.existsSync(lock)) fs.unlinkSync(lock);
+    } catch {
+      /* */
+    }
+    logAccess(`STUDIO_PACKAGE_SANITIZE lucide-react -> ${STUDIO_NPM_LUCIDE_REACT} in ${wsRoot}`);
+  }
+  return changed;
 }
 
 function studioSanitizeRelativePath(relRaw) {
@@ -904,14 +960,19 @@ async function executeStudioPreviewBuild(userId, projectId) {
     const planMd = project?.plan?.markdown || '';
     if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
 
-    const header = `[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
-    const r1 = await runNpm(ws, ['ci', '--no-audit', '--no-fund'], STUDIO_BUILD_TIMEOUT_MS);
+    const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
+    const header = `${pkgSanitized ? '[studio] скорректирован lucide-react в package.json; package-lock.json пересоздаётся\n' : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
+    const npmInstallCmd = pkgSanitized
+      ? ['install', '--no-audit', '--no-fund']
+      : ['ci', '--no-audit', '--no-fund'];
+    const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
     if (r1.code !== 0) {
       await persistStudioBuildResult(userId, projectId, false, r1.code, header + r1.log, executor);
       return;
     }
     const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
-    const combined = `${header}=== npm ci ===\n${r1.log}\n=== npm run build ===\n${r2.log}`;
+    const r1Label = pkgSanitized ? '=== npm install ===' : '=== npm ci ===';
+    const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
     await persistStudioBuildResult(userId, projectId, r2.code === 0, r2.code, combined, executor);
   } catch (e) {
     logError(`STUDIO_BUILD ${userId} ${projectId} ${e.stack || e.message}`);
@@ -1253,6 +1314,7 @@ function buildStudioJsonOpsPrompt({
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не используй корни node_modules, dist, .git, .vite.
+- В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET).
 ${headLine}
 
 Файлы в workspace (фрагмент списка):
