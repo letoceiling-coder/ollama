@@ -806,6 +806,78 @@ function studioSanitizeWorkspaceNpmrc(wsRoot) {
   return true;
 }
 
+/**
+ * Превью раздаётся под /preview/<token>/; при Vite base: '/' в index.html идут /assets/... с корня домена → 404 и белый iframe.
+ */
+function studioWorkspaceUsesVite(wsRoot) {
+  const fp = path.join(wsRoot, 'package.json');
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    return false;
+  }
+  const s = `${pkg.scripts?.build || ''} ${pkg.scripts?.dev || ''} ${pkg.scripts?.preview || ''}`;
+  return /\bvite\b/.test(s) || Boolean(pkg.dependencies?.vite || pkg.devDependencies?.vite);
+}
+
+function studioPatchViteConfigContent(raw) {
+  if (/base\s*:\s*['"]\.\/?['"]/.test(raw)) return raw;
+  let next = raw;
+  if (/base\s*:/.test(next)) {
+    next = next.replace(/base\s*:\s*['"`][^'"`]*['"`]/g, "base: './'");
+    if (/base\s*:/.test(next) && !/base\s*:\s*['"]\.\/?['"]/.test(next)) {
+      next = next.replace(/base\s*:\s*[^,\r\n}\]]+/g, "base: './'");
+    }
+  }
+  if (!/base\s*:/.test(next)) {
+    if (/defineConfig\s*\(\s*\{/.test(next)) {
+      next = next.replace(/defineConfig\s*\(\s*\{/, "defineConfig({\n  base: './',");
+    } else if (/export\s+default\s*\{/.test(next)) {
+      next = next.replace(/export\s+default\s*\{/, "export default {\n  base: './',");
+    }
+  }
+  return next;
+}
+
+/** Перед сборкой: base: './' в vite.config.* или копия шаблона, если конфига нет. */
+function studioEnsureViteRelativeBase(wsRoot) {
+  if (!studioWorkspaceUsesVite(wsRoot)) return false;
+  const names = ['vite.config.ts', 'vite.config.mts', 'vite.config.js', 'vite.config.mjs', 'vite.config.cjs'];
+  let changed = false;
+  let found = false;
+  for (const name of names) {
+    const fp = path.join(wsRoot, name);
+    if (!fs.existsSync(fp)) continue;
+    found = true;
+    let raw;
+    try {
+      raw = fs.readFileSync(fp, 'utf8');
+    } catch {
+      continue;
+    }
+    const next = studioPatchViteConfigContent(raw);
+    if (next !== raw) {
+      fs.writeFileSync(fp, next, 'utf8');
+      changed = true;
+      logAccess(`STUDIO_VITE_BASE_RELATIVE ${name} ${wsRoot}`);
+    }
+  }
+  if (!found) {
+    const tpl = path.join(STUDIO_TEMPLATE_DIR, 'vite.config.ts');
+    if (fs.existsSync(tpl)) {
+      try {
+        fs.copyFileSync(tpl, path.join(wsRoot, 'vite.config.ts'));
+        changed = true;
+        logAccess(`STUDIO_VITE_BASE_RELATIVE template vite.config.ts ${wsRoot}`);
+      } catch {
+        /* */
+      }
+    }
+  }
+  return changed;
+}
+
 /** Пины vite + @vitejs/plugin-react + typescript из шаблона (снимает vite@3 + plugin@4). */
 function studioEnsureViteToolchain(pkg) {
   const tpl = studioReadTemplatePackageJson();
@@ -1383,6 +1455,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const npmrcSanitized = studioSanitizeWorkspaceNpmrc(ws);
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
+  const viteBaseOk = studioEnsureViteRelativeBase(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
     !STUDIO_PREVIEW_USE_NPM_CI ||
@@ -1395,6 +1468,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     npmrcSanitized ? '[studio] очищен .npmrc (production/omit=dev)' : null,
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
+    viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
