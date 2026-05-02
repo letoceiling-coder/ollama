@@ -1,0 +1,19 @@
+[Unit]
+Description=Ollama API gateway (Express on :3011)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/ollama-api
+EnvironmentFile=/var/www/ollama-api/.env
+ExecStart=/usr/bin/node /var/www/ollama-api/index.js
+Restart=always
+RestartSec=4
+
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

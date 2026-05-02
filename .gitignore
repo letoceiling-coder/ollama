@@ -1,9 +1,40 @@
+# Secrets and local env (не использовать .env.* — иначе игнорируется .env.example)
+.env
+.env.local
+**/.env
+!**/.env.example
+!/.env.example
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output (собирается при деплое)
+ollama-web-react/dist/
+
+# API runtime (как на VPS — не в Git)
+ollama-api/node_modules/
+ollama-api/logs/
+ollama-api/uploads/
+ollama-api/data/users/*
+!ollama-api/data/users/.gitkeep
+
+# Старый путь api/ — если используется локально
 api/node_modules/
 api/.env
 api/logs/
 api/uploads/
 api/data/users/*
 !api/data/users/.gitkeep
+
+# Артефакты и мусор
+*.tgz
+tmp-openai.json
+ollama-web-react/tsconfig.tsbuildinfo
+
+# .NET build outputs
+**/bin/
+**/obj/
 
 .DS_Store
 Thumbs.db
