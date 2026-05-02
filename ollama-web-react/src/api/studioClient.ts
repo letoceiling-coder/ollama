@@ -1,4 +1,4 @@
-import type { StudioProject } from './studioTypes';
+import type { StudioFileContent, StudioProject, StudioWorkspaceFileEntry } from './studioTypes';
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, {
@@ -99,4 +99,30 @@ export async function postStudioPreviewBuild(projectId: string): Promise<{ accep
 
 export function studioPreviewUrl(projectId: string): string {
   return `/api/studio/projects/${encodeURIComponent(projectId)}/preview/`;
+}
+
+/** Фаза 1 (план §4.2): список файлов workspace. */
+export async function getStudioWorkspaceFiles(projectId: string): Promise<StudioWorkspaceFileEntry[]> {
+  const d = await jsonFetch<{ files: StudioWorkspaceFileEntry[] }>(
+    `/api/studio/projects/${encodeURIComponent(projectId)}/files`,
+  );
+  return d.files;
+}
+
+export async function getStudioFileContent(projectId: string, filePath: string): Promise<StudioFileContent> {
+  const q = new URLSearchParams({ path: filePath });
+  return jsonFetch<StudioFileContent>(
+    `/api/studio/projects/${encodeURIComponent(projectId)}/files/content?${q}`,
+  );
+}
+
+export async function putStudioFileContent(
+  projectId: string,
+  filePath: string,
+  content: string,
+): Promise<{ ok: boolean; path: string; bytes: number }> {
+  return jsonFetch(`/api/studio/projects/${encodeURIComponent(projectId)}/files/content`, {
+    method: 'PUT',
+    body: JSON.stringify({ path: filePath, content }),
+  });
 }

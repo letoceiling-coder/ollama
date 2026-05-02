@@ -38,3 +38,19 @@ export interface StudioLastBuild {
   executor?: 'docker' | 'host';
   log: string;
 }
+
+/** Запись в workspace (план §4.2). */
+export interface StudioWorkspaceFileEntry {
+  path: string;
+  type: 'file';
+  size: number;
+  mtime: number;
+}
+
+export interface StudioFileContent {
+  path: string;
+  content: string;
+  encoding: 'utf8';
+  size: number;
+  mtime: number;
+}

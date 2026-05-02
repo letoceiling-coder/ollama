@@ -393,15 +393,20 @@ export function ChatLayout() {
       <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           className="pointer-events-none absolute right-4 top-3 z-[15] select-none text-xs tabular-nums text-zinc-400 md:right-6"
-          title="Состояние Ollama (обновление каждые 5 с)"
+          title="Состояние Ollama: шлюз опрашивает OLLAMA_URL (на проде через туннель с домашней машины)"
           aria-live="polite"
         >
           {ollamaHealth === null ? (
             <span>Ollama …</span>
           ) : ollamaHealth === 'ok' ? (
-            <span>🟢 online</span>
+            <span title="Модели доступны через шлюз">🟢 online</span>
           ) : (
-            <span>🔴 offline</span>
+            <span
+              title="Нет ответа от Ollama по OLLAMA_URL (на VPS чаще всего нужен SSH-туннель с ПК, где запущен ollama serve — см. docs/SERVER_AND_REPO.md). Сайт и чат работают, генерация — после восстановления туннеля."
+              className="cursor-help border-b border-dotted border-zinc-500"
+            >
+              🔴 offline
+            </span>
           )}
         </div>
 

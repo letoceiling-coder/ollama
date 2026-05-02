@@ -4,10 +4,13 @@ import { Link } from 'react-router-dom';
 import {
   approveStudioPlan,
   createStudioProject,
+  getStudioFileContent,
   getStudioProject,
   getStudioProjects,
+  getStudioWorkspaceFiles,
   postStudioPlan,
   postStudioPreviewBuild,
+  putStudioFileContent,
   studioPreviewUrl,
 } from '../api/studioClient';
 import type { StudioProject } from '../api/studioTypes';
@@ -145,7 +148,10 @@ export function LovableStudio() {
     onSuccess: () => {
       setFlowError(null);
       void queryClient.invalidateQueries({ queryKey: QK.projects });
-      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      if (projectId) {
+        void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+        void queryClient.invalidateQueries({ queryKey: ['studio', 'files', projectId] });
+      }
       setPreviewKey((k) => k + 1);
       setMessages((prev) => [
         ...prev,
@@ -173,7 +179,54 @@ export function LovableStudio() {
     postPlanMu.mutate({ id: projectId, md });
   }, [draft, projectId, postPlanMu]);
 
-  const busy = postPlanMu.isPending || approveMu.isPending || createProjectMu.isPending || buildMu.isPending;
+  const [editorDraft, setEditorDraft] = useState('');
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+
+  const filesQuery = useQuery({
+    queryKey: ['studio', 'files', projectId],
+    queryFn: () => getStudioWorkspaceFiles(projectId!),
+    enabled: !!projectId,
+  });
+
+  const fileContentQuery = useQuery({
+    queryKey: ['studio', 'file', projectId, selectedFilePath],
+    queryFn: () => getStudioFileContent(projectId!, selectedFilePath!),
+    enabled: !!projectId && !!selectedFilePath,
+  });
+
+  useEffect(() => {
+    setEditorDraft('');
+  }, [selectedFilePath]);
+
+  useEffect(() => {
+    if (fileContentQuery.data?.content !== undefined) {
+      setEditorDraft(fileContentQuery.data.content);
+    }
+  }, [fileContentQuery.data?.path, fileContentQuery.data?.mtime]);
+
+  const saveFileMu = useMutation({
+    mutationFn: () => putStudioFileContent(projectId!, selectedFilePath!, editorDraft),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'files', projectId] });
+      void queryClient.invalidateQueries({ queryKey: ['studio', 'file', projectId, selectedFilePath] });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'agent',
+          content: `Файл **${selectedFilePath}** сохранён в workspace.`,
+        },
+      ]);
+    },
+    onError: (e: Error) => setFlowError(e.message),
+  });
+
+  const busy =
+    postPlanMu.isPending ||
+    approveMu.isPending ||
+    createProjectMu.isPending ||
+    buildMu.isPending ||
+    saveFileMu.isPending;
 
   const iframeRealSrc =
     project?.taskStatus === 'ready_for_review' && projectId
@@ -311,12 +364,75 @@ export function LovableStudio() {
             )}
 
             <p className="mt-6 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Файлы (заглушка)
+              Файлы workspace
             </p>
-            <ul className="mt-3 space-y-1.5 font-mono text-[12px] text-zinc-400">
-              <li className="rounded-md bg-white/[0.04] px-2 py-1">src/App.tsx</li>
-              <li className="rounded-md px-2 py-1">… после фазы runner</li>
-            </ul>
+            {!projectId ? (
+              <p className="mt-2 text-[12px] text-zinc-500">Ожидаем проект…</p>
+            ) : filesQuery.isLoading ? (
+              <p className="mt-2 text-[12px] text-zinc-400">Загрузка списка…</p>
+            ) : filesQuery.isError ? (
+              <p className="mt-2 text-[12px] text-red-300">Не удалось загрузить файлы</p>
+            ) : (
+              <div className="mt-2 space-y-2">
+                <ul className="scrollbar-thin max-h-36 list-none space-y-0.5 overflow-y-auto font-mono text-[11px] text-zinc-400">
+                  {filesQuery.data?.length ? (
+                    filesQuery.data.map((f) => (
+                      <li key={f.path}>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => {
+                            setSelectedFilePath(f.path);
+                            setFlowError(null);
+                          }}
+                          className={`w-full truncate rounded-md px-2 py-1 text-left transition ${
+                            selectedFilePath === f.path
+                              ? 'bg-accent/20 text-emerald-100 ring-1 ring-accent/30'
+                              : 'bg-white/[0.04] hover:bg-white/[0.07]'
+                          } disabled:opacity-40`}
+                        >
+                          {f.path}
+                          <span className="ml-1 text-zinc-600">({f.size} B)</span>
+                        </button>
+                      </li>
+                    ))
+                  ) : (
+                    <li className="px-2 text-zinc-500">Нет файлов (шаблон появится после первого открытия проекта)</li>
+                  )}
+                </ul>
+                {selectedFilePath ? (
+                  <div className="rounded-lg border border-white/10 bg-black/35 p-2">
+                    <p className="mb-1 truncate font-mono text-[10px] text-zinc-500">{selectedFilePath}</p>
+                    {fileContentQuery.isLoading ? (
+                      <p className="text-[11px] text-zinc-500">Чтение…</p>
+                    ) : fileContentQuery.isError ? (
+                      <p className="text-[11px] text-red-300">Ошибка чтения</p>
+                    ) : (
+                      <>
+                        <textarea
+                          value={editorDraft}
+                          onChange={(e) => setEditorDraft(e.target.value)}
+                          disabled={busy}
+                          spellCheck={false}
+                          className="scrollbar-thin mt-1 max-h-48 min-h-[8rem] w-full resize-y rounded-md border border-white/10 bg-black/50 px-2 py-1.5 font-mono text-[11px] text-zinc-200 focus:border-accent/40 disabled:opacity-45"
+                          rows={10}
+                        />
+                        <button
+                          type="button"
+                          disabled={busy || fileContentQuery.isFetching}
+                          onClick={() => saveFileMu.mutate()}
+                          className="mt-2 w-full rounded-md border border-emerald-500/40 bg-emerald-500/15 py-1.5 text-[12px] font-medium text-emerald-100 hover:bg-emerald-500/25 disabled:opacity-40"
+                        >
+                          Сохранить файл
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-zinc-600">Выберите файл для просмотра и правки.</p>
+                )}
+              </div>
+            )}
           </div>
         </aside>
 

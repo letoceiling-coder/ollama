@@ -547,6 +547,9 @@ const STUDIO_DOCKER_CPUS = (process.env.STUDIO_DOCKER_CPUS || '2').trim();
 const STUDIO_PREVIEW_TTL_MS = Number(process.env.STUDIO_PREVIEW_TTL_MS || 45 * 60 * 1000);
 const STUDIO_MAX_BUILDS_GLOBAL = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_GLOBAL || 20));
 const STUDIO_MAX_BUILDS_PER_USER = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_PER_USER || 2));
+const STUDIO_FILE_MAX_READ = Math.min(Number(process.env.STUDIO_FILE_MAX_READ || 1_500_000), 5_000_000);
+const STUDIO_FILE_MAX_WRITE = Math.min(Number(process.env.STUDIO_FILE_MAX_WRITE || 1_500_000), 5_000_000);
+const STUDIO_WORKSPACE_IGNORE = new Set(['node_modules', 'dist', '.git', '.vite', '.DS_Store']);
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
@@ -578,6 +581,50 @@ function ensureStudioWorkspaceScaffold(userId, projectId) {
     },
   });
   return ws;
+}
+
+function studioSanitizeRelativePath(relRaw) {
+  const s = String(relRaw || '').replace(/\\/g, '/');
+  const parts = s.split('/').filter((p) => p.length > 0 && p !== '.');
+  if (parts.some((p) => p === '..')) return null;
+  return parts.join('/');
+}
+
+function studioResolveWorkspacePath(wsRoot, relPortable) {
+  const root = path.resolve(wsRoot);
+  const joined = path.resolve(path.join(root, ...relPortable.split('/')));
+  if (joined !== root && !joined.startsWith(root + path.sep)) return null;
+  return joined;
+}
+
+function studioListWorkspaceFiles(wsRoot) {
+  const out = [];
+  function walk(dir, prefix) {
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of ents) {
+      if (STUDIO_WORKSPACE_IGNORE.has(e.name)) continue;
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(fp, rel);
+      } else if (e.isFile()) {
+        try {
+          const st = fs.statSync(fp);
+          out.push({ path: rel, type: 'file', size: st.size, mtime: st.mtimeMs });
+        } catch {
+          /* */
+        }
+      }
+    }
+  }
+  walk(path.resolve(wsRoot), '');
+  out.sort((a, b) => a.path.localeCompare(b.path));
+  return out.slice(0, 800);
 }
 
 /** Путь тома для `docker -v` (Windows → стиль /c/... для Docker Desktop). */
@@ -1515,6 +1562,126 @@ app.delete('/api/studio/projects/:projectId', async (req, res) => {
     res.status(204).end();
   } catch (e) {
     logError(`STUDIO_PROJECT_DELETE ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** Фаза 1 (план §4.2): файлы workspace без ревизий — список, чтение, запись (MVP). */
+app.get('/api/studio/projects/:projectId/files', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    if (!data.studioProjects.some((p) => p.id === projectId)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const ws = ensureStudioWorkspaceScaffold(req.userId, projectId);
+    const files = studioListWorkspaceFiles(ws);
+    res.json({ files });
+  } catch (e) {
+    logError(`STUDIO_FILES_LIST ${req.userId} ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.get('/api/studio/projects/:projectId/files/content', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const rel = studioSanitizeRelativePath(req.query.path);
+  if (!rel) {
+    res.status(400).json({ error: 'bad_path' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    if (!data.studioProjects.some((p) => p.id === projectId)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const ws = ensureStudioWorkspaceScaffold(req.userId, projectId);
+    const fp = studioResolveWorkspacePath(ws, rel);
+    if (!fp || !fs.existsSync(fp)) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const st = fs.statSync(fp);
+    if (!st.isFile()) {
+      res.status(400).json({ error: 'not_a_file' });
+      return;
+    }
+    if (st.size > STUDIO_FILE_MAX_READ) {
+      res.status(413).json({ error: 'file_too_large' });
+      return;
+    }
+    const buf = fs.readFileSync(fp);
+    let text;
+    try {
+      text = buf.toString('utf8');
+    } catch {
+      res.status(415).json({ error: 'binary_or_decode_error' });
+      return;
+    }
+    res.json({ path: rel, content: text, encoding: 'utf8', size: st.size, mtime: st.mtimeMs });
+  } catch (e) {
+    logError(`STUDIO_FILE_GET ${req.userId} ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.put('/api/studio/projects/:projectId/files/content', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const rel = studioSanitizeRelativePath(body.path);
+  if (!rel) {
+    res.status(400).json({ error: 'bad_path' });
+    return;
+  }
+  if (typeof body.content !== 'string') {
+    res.status(400).json({ error: 'bad_content' });
+    return;
+  }
+  const content = body.content.slice(0, STUDIO_FILE_MAX_WRITE);
+  if (Buffer.byteLength(content, 'utf8') > STUDIO_FILE_MAX_WRITE) {
+    res.status(413).json({ error: 'file_too_large' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    const ws = ensureStudioWorkspaceScaffold(req.userId, projectId);
+    const fp = studioResolveWorkspacePath(ws, rel);
+    if (!fp) {
+      res.status(400).json({ error: 'bad_path' });
+      return;
+    }
+    const parts = rel.split('/');
+    if (parts.length && STUDIO_WORKSPACE_IGNORE.has(parts[0])) {
+      res.status(403).json({ error: 'forbidden_path' });
+      return;
+    }
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, content, 'utf8');
+    project.updatedAt = Date.now();
+    saveUserFile(req.userId, data);
+    logAccess(`STUDIO_FILE_PUT user=${req.userId} project=${projectId} path=${rel}`);
+    res.json({ ok: true, path: rel, bytes: Buffer.byteLength(content, 'utf8') });
+  } catch (e) {
+    logError(`STUDIO_FILE_PUT ${req.userId} ${e.message}`);
     res.status(500).json({ error: 'storage_error' });
   }
 });
