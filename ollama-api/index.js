@@ -878,6 +878,71 @@ function studioEnsureViteRelativeBase(wsRoot) {
   return changed;
 }
 
+/** LLM часто пишет type="text/typescript" или забывает module — vite build тогда копирует мусор в dist → белый экран. */
+function studioIndexHtmlBrokenForVite(html) {
+  const h = String(html || '');
+  if (!h.trim()) return true;
+  if (/text\/typescript/i.test(h)) return true;
+  if (!/<script[^>]+src=/i.test(h) && !/<link[^>]+href=/i.test(h)) return true;
+  if (/\.(tsx|jsx)(\?|"|'|>|\s)/i.test(h)) {
+    const blocks = h.match(/<script\b[^>]*>/gi) || [];
+    for (const tag of blocks) {
+      if (/\.(tsx|jsx)(\?|"|')/i.test(tag) && !/type\s*=\s*["']module["']/i.test(tag)) return true;
+    }
+  }
+  return false;
+}
+
+/** Подмена index.html эталоном из studio-template перед vite build. */
+function studioEnsureWorkspaceIndexHtml(wsRoot) {
+  if (!studioWorkspaceUsesVite(wsRoot)) return false;
+  const fp = path.join(wsRoot, 'index.html');
+  const tpl = path.join(STUDIO_TEMPLATE_DIR, 'index.html');
+  if (!fs.existsSync(tpl)) return false;
+  let raw = '';
+  try {
+    raw = fs.existsSync(fp) ? fs.readFileSync(fp, 'utf8') : '';
+  } catch {
+    raw = '';
+  }
+  if (!raw.trim() || studioIndexHtmlBrokenForVite(raw)) {
+    try {
+      fs.copyFileSync(tpl, fp);
+      logAccess(`STUDIO_INDEX_HTML_RESET ${wsRoot}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** После vite build: реальный бандл или снова сырой tsx в index. */
+function studioValidateVitePreviewDist(wsRoot) {
+  const dist = path.join(wsRoot, 'dist');
+  const idx = path.join(dist, 'index.html');
+  if (!fs.existsSync(idx)) return { ok: false, reason: 'нет dist/index.html' };
+  let html;
+  try {
+    html = fs.readFileSync(idx, 'utf8');
+  } catch (e) {
+    return { ok: false, reason: String(e.message || e) };
+  }
+  if (/text\/typescript/i.test(html)) {
+    return { ok: false, reason: 'dist/index.html: text/typescript (entry не обработан Vite)' };
+  }
+  if (/src=["']\.?\/?src\/[^"']+\.(tsx|jsx)(\?[^"']*)?["']/i.test(html)) {
+    return { ok: false, reason: 'dist/index.html всё ещё указывает на .tsx/.jsx — не production-сборка' };
+  }
+  const assetsDir = path.join(dist, 'assets');
+  if (!fs.existsSync(assetsDir) || !fs.statSync(assetsDir).isDirectory()) {
+    return { ok: false, reason: 'нет dist/assets (пустая или неверная сборка)' };
+  }
+  const chunks = fs.readdirSync(assetsDir).filter((f) => /\.(js|mjs)$/i.test(f));
+  if (!chunks.length) return { ok: false, reason: 'dist/assets не содержит .js' };
+  return { ok: true };
+}
+
 /** Пины vite + @vitejs/plugin-react + typescript из шаблона (снимает vite@3 + plugin@4). */
 function studioEnsureViteToolchain(pkg) {
   const tpl = studioReadTemplatePackageJson();
@@ -1492,11 +1557,13 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
   const viteBaseOk = studioEnsureViteRelativeBase(ws);
+  const indexHtmlReset = studioEnsureWorkspaceIndexHtml(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
     !STUDIO_PREVIEW_USE_NPM_CI ||
     pkgRepaired ||
     pkgSanitized ||
+    indexHtmlReset ||
     !lockPresent ||
     npmrcSanitized;
   const headerExtra = [
@@ -1505,6 +1572,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
+    indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
@@ -1520,15 +1588,23 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
   }
   const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
-  if (r2.code === 0) {
+  let buildOk = r2.code === 0;
+  let r2Log = r2.log;
+  if (buildOk) {
     try {
       studioRewriteBuiltPreviewAbsolutes(path.join(ws, 'dist'));
     } catch (e) {
       logError(`STUDIO_DIST_REWRITE ${e.message}`);
     }
+    const check = studioValidateVitePreviewDist(ws);
+    if (!check.ok) {
+      buildOk = false;
+      r2Log = `${r2Log}\n=== studio: проверка dist ===\nFAIL: ${check.reason}\n`;
+    }
   }
-  const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
-  return { ok: r2.code === 0, exitCode: r2.code || 0, chunk: combined };
+  const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2Log}`;
+  const finalExit = buildOk ? 0 : r2.code !== 0 ? r2.code : 1;
+  return { ok: buildOk, exitCode: finalExit, chunk: combined };
 }
 
 async function executeStudioPreviewBuild(userId, projectId) {
