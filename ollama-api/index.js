@@ -590,6 +590,11 @@ const STUDIO_CLOUD_MAX_TOKENS = Math.min(
 );
 /** Диапазон для lucide-react, если модель указала несуществующий (типично ^0.5.0). */
 const STUDIO_NPM_LUCIDE_REACT = (process.env.STUDIO_NPM_LUCIDE_REACT || '^1.0.0').trim() || '^1.0.0';
+/** Неверные ключи в dependencies/devDependencies (на npm другое имя). */
+const STUDIO_NPM_PACKAGE_KEY_FIXES = {
+  'tailwind-css': 'tailwindcss',
+  tailwind_css: 'tailwindcss',
+};
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
@@ -638,6 +643,87 @@ function studioLucideReactRangeLooksInvalid(range) {
     if (minor > 0 && minor < 100) return true;
   }
   return false;
+}
+
+let studioTemplatePkgCache = null;
+function studioReadTemplatePackageJson() {
+  if (studioTemplatePkgCache) return studioTemplatePkgCache;
+  const fp = path.join(STUDIO_TEMPLATE_DIR, 'package.json');
+  try {
+    studioTemplatePkgCache = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    studioTemplatePkgCache = null;
+  }
+  return studioTemplatePkgCache;
+}
+
+/** Удаляет обратный слэш перед недопустимой в JSON escape-последовательностью (модель пишет \\w и т.д.). */
+function studioRepairInvalidJsonBackslashes(s) {
+  let t = s;
+  for (let i = 0; i < 24; i++) {
+    const next = t.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '');
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
+function studioRenameMalformedNpmPackageKeys(pkg) {
+  const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+  let changed = false;
+  for (const sec of sections) {
+    const o = pkg[sec];
+    if (!o || typeof o !== 'object') continue;
+    for (const [bad, good] of Object.entries(STUDIO_NPM_PACKAGE_KEY_FIXES)) {
+      if (typeof o[bad] !== 'string') continue;
+      const v = o[bad];
+      delete o[bad];
+      if (typeof o[good] !== 'string') o[good] = v;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function studioDropBogusDependencies(pkg) {
+  const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+  let changed = false;
+  for (const sec of sections) {
+    const o = pkg[sec];
+    if (!o || typeof o !== 'object') continue;
+    if (typeof o.test === 'string' && /juest/i.test(o.test)) {
+      delete o.test;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** Если в scripts есть vite, но пакета vite нет — подставляем из studio-template (иначе vite: not found). */
+function studioEnsureViteToolchain(pkg) {
+  const tpl = studioReadTemplatePackageJson();
+  if (!tpl || !tpl.devDependencies || typeof tpl.devDependencies !== 'object') return false;
+  const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
+  const joined = `${String(scripts.build || '')} ${String(scripts.dev || '')} ${String(scripts.preview || '')}`;
+  if (!/\bvite\b/.test(joined)) return false;
+  const need = ['vite', '@vitejs/plugin-react', 'typescript'];
+  let changed = false;
+  for (const name of need) {
+    const vtpl = tpl.devDependencies[name];
+    if (typeof vtpl !== 'string') continue;
+    const anywhere =
+      pkg.dependencies?.[name] ||
+      pkg.devDependencies?.[name] ||
+      pkg.optionalDependencies?.[name];
+    if (typeof anywhere === 'string') continue;
+    if (!pkg.devDependencies || typeof pkg.devDependencies !== 'object') {
+      pkg.devDependencies = {};
+      changed = true;
+    }
+    pkg.devDependencies[name] = vtpl;
+    changed = true;
+  }
+  return changed;
 }
 
 /** Удаляет управляющие символы из всех строк в дереве package.json (LLM иногда вставляет U+0012 в версии). */
@@ -704,8 +790,16 @@ function studioRepairCorruptWorkspacePackageJson(wsRoot) {
   } catch {
     /* */
   }
-  const stripped = raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
-  const candidates = [stripped, studioRepairHyphenBetweenJsonStrings(stripped)];
+  const stripped = raw
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\uFFFD]/g, '')
+    .replace(/\uFEFF/g, '');
+  const candidates = [
+    stripped,
+    studioRepairHyphenBetweenJsonStrings(stripped),
+    studioRepairInvalidJsonBackslashes(stripped),
+    studioRepairInvalidJsonBackslashes(studioRepairHyphenBetweenJsonStrings(stripped)),
+    studioRepairHyphenBetweenJsonStrings(studioRepairInvalidJsonBackslashes(stripped)),
+  ];
   let pkg = null;
   for (const body of candidates) {
     try {
@@ -745,6 +839,9 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
   }
   if (!pkg || typeof pkg !== 'object') return false;
   let changed = studioStripControlCharsFromPackageJsonStrings(pkg);
+  changed = studioRenameMalformedNpmPackageKeys(pkg) || changed;
+  changed = studioDropBogusDependencies(pkg) || changed;
+  changed = studioEnsureViteToolchain(pkg) || changed;
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
   for (const sec of sections) {
     const o = pkg[sec];
@@ -976,6 +1073,10 @@ function runNpmInDocker(cwd, npmArgs, timeoutMs) {
       '--cap-drop',
       'ALL',
       '-e',
+      'NPM_CONFIG_PRODUCTION=false',
+      '-e',
+      'NODE_ENV=development',
+      '-e',
       'CI=1',
       '-e',
       'NPM_CONFIG_UPDATE_NOTIFIER=false',
@@ -1026,7 +1127,12 @@ function runNpmInWorkspace(cwd, args, timeoutMs) {
     const child = spawn(cmd, args, {
       cwd,
       shell: false,
-      env: { ...process.env, CI: '1' },
+      env: {
+        ...process.env,
+        CI: '1',
+        NODE_ENV: 'development',
+        NPM_CONFIG_PRODUCTION: 'false',
+      },
     });
     let log = '';
     const push = (d) => {
@@ -1502,7 +1608,7 @@ function buildStudioJsonOpsPrompt({
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не используй корни node_modules, dist, .git, .vite.
-- В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET). Имя пакета: **lucide-react**, не \`licide-react\`.
+- В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET). Имя пакета: **lucide-react**, не \`licide-react\`. Tailwind: пакет **tailwindcss**, не \`tailwind-css\`.
 - Версии в dependencies: только печатные символы, без управляющих Unicode (иначе npm не прочитает package.json).
 ${headLine}
 
@@ -1543,7 +1649,7 @@ function buildStudioBuildRecoveryPrompt({ headRevisionId, fileSummary, projectPl
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не трогай node_modules, dist, .git, .vite.
-- **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`. Не пиши \`licide-react\` (опечатка).
+- **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`. Не пиши \`licide-react\` (опечатка). **tailwindcss**, не \`tailwind-css\`.
 - Если не хватает lockfile — допусти правку только package.json; сервер сам выполнит npm install.
 - Строки версий в dependencies: только обычные printable-символы, **без** управляющих символов (0x00–0x1F).
 ${headLine}
