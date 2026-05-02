@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node index.js",
+    "start:test-keys": "node scripts/start-test-env.js",
     "studio-runner:build": "docker build -t ollama-studio-runner:local ./studio-runner"
   },
   "dependencies": {

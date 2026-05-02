@@ -1,9 +1,14 @@
 'use strict';
 
-require('dotenv').config();
+const path = require('path');
+const envFile = process.env.DOTENV_CONFIG_PATH
+  ? path.isAbsolute(process.env.DOTENV_CONFIG_PATH)
+    ? process.env.DOTENV_CONFIG_PATH
+    : path.join(__dirname, process.env.DOTENV_CONFIG_PATH)
+  : path.join(__dirname, '.env');
+require('dotenv').config({ path: envFile });
 
 const fs = require('fs');
-const path = require('path');
 const express = require('express');
 const crypto = require('crypto');
 const readline = require('readline');

@@ -2,6 +2,7 @@
 .env
 .env.local
 **/.env
+ollama-api/.env.test
 !**/.env.example
 !/.env.example
 
