@@ -817,6 +817,36 @@ function runNpmInDocker(cwd, npmArgs, timeoutMs) {
     const dockerArgs = ['run', '--rm'];
     const dockerNet = (process.env.STUDIO_DOCKER_NETWORK || '').trim();
     if (dockerNet) dockerArgs.push('--network', dockerNet);
+    /** Образ `node` часто завершается на `USER node` (uid 1000); workspace создаёт процесс API (`www-data` и т.д.). Совмещаем uid/gid с API, иначе npm на смонтированном томе — EACCES. */
+    const dockerUserExplicit = (process.env.STUDIO_DOCKER_USER || '').trim();
+    let dockerMatchHostOwner = false;
+    if (process.platform !== 'win32') {
+      if (dockerUserExplicit) {
+        dockerArgs.push('--user', dockerUserExplicit);
+        dockerMatchHostOwner = true;
+      } else {
+        try {
+          const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+          const gid = typeof process.getgid === 'function' ? process.getgid() : -1;
+          if (uid >= 0 && gid >= 0) {
+            dockerArgs.push('--user', `${uid}:${gid}`);
+            dockerMatchHostOwner = true;
+          }
+        } catch {
+          /* */
+        }
+      }
+    }
+    if (dockerMatchHostOwner) {
+      const u0 = dockerUserExplicit
+        ? Number((dockerUserExplicit.split(':')[0] || '').trim())
+        : typeof process.getuid === 'function'
+          ? process.getuid()
+          : 0;
+      if (!Number.isFinite(u0) || u0 !== 0) {
+        dockerArgs.push('-e', 'HOME=/tmp');
+      }
+    }
     dockerArgs.push(
       '--pull',
       'missing',
