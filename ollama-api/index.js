@@ -1299,10 +1299,55 @@ function parseAgentWorkspaceOperations(raw) {
   return { ok: true, err: null, operations: obj.operations, base_revision_id };
 }
 
+/** Эвристика: простые реплики → дешёвые облачные модели; сложные → Sonnet / 4o и т.д. */
+function estimateCloudTaskTier(promptText) {
+  const s = String(promptText || '').trim();
+  if (!s) return 'lite';
+  if (s.length > 2600) return 'standard';
+  const lines = s.split(/\r?\n/).length;
+  if (s.length > 700 && lines > 10) return 'standard';
+  if (/```/.test(s)) return 'standard';
+  if (
+    /\b(refactor|docker|kubernetes|microservice|postgres|mongodb|prisma|graphql|openapi|tailwind\s*config|vite\.config|webpack|nginx|systemd|middleware)\b/i.test(
+      s,
+    )
+  ) {
+    return 'standard';
+  }
+  if (
+    /(напиши|создай|собери|реализуй|спроектируй).{0,48}(приложен|сайт|проект|сервис|интерфейс|backend|бэкенд|фронт|лендинг|dashboard|бота)/i.test(
+      s,
+    )
+  ) {
+    return 'standard';
+  }
+  if (/(полн(ый|ого)|целиком|production|продакшн).{0,24}(код|проект|стек|репозитор)/i.test(s)) {
+    return 'standard';
+  }
+  if (/\b(base_revision_id|studio\.patch|operations\"\s*:|content_base64)\b/i.test(s)) {
+    return 'standard';
+  }
+  if (
+    /(техническ(ое|ий)\s+задан|ТЗ\s|архитектур|многостраничн|интеграци(?:я|ю)\s+с\s+api)/i.test(
+      s,
+    )
+  ) {
+    return 'standard';
+  }
+  return 'lite';
+}
+
 /** Модели по ролям: стрим = связные планы; json = строгая схема PATCH workspace. */
 function studioStreamAnthropicModel() {
   return String(
     process.env.ANTHROPIC_MODEL_STREAM || process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514',
+  ).trim();
+}
+function studioStreamAnthropicModelLite() {
+  return String(
+    process.env.ANTHROPIC_MODEL_STREAM_LITE ||
+      process.env.ANTHROPIC_MODEL_LITE ||
+      'claude-3-5-haiku-20241022',
   ).trim();
 }
 function studioJsonAnthropicModel() {
@@ -1315,6 +1360,13 @@ function studioStreamOpenAiModel() {
     process.env.OPENAI_STUDIO_MODEL_STREAM || process.env.OPENAI_STUDIO_MODEL || 'gpt-4o',
   ).trim();
 }
+function studioStreamOpenAiModelLite() {
+  return String(
+    process.env.OPENAI_STUDIO_MODEL_STREAM_LITE ||
+      process.env.OPENAI_STUDIO_MODEL_LITE ||
+      'gpt-4o-mini',
+  ).trim();
+}
 function studioJsonOpenAiModel() {
   return String(
     process.env.OPENAI_STUDIO_MODEL_JSON || process.env.OPENAI_STUDIO_MODEL || 'gpt-4o',
@@ -1323,6 +1375,13 @@ function studioJsonOpenAiModel() {
 function studioStreamGeminiModel() {
   return String(
     process.env.GEMINI_STUDIO_MODEL_STREAM || process.env.GEMINI_STUDIO_MODEL || 'gemini-2.0-flash',
+  ).trim();
+}
+function studioStreamGeminiModelLite() {
+  return String(
+    process.env.GEMINI_STUDIO_MODEL_STREAM_LITE ||
+      process.env.GEMINI_STUDIO_MODEL_LITE ||
+      'gemini-2.0-flash',
   ).trim();
 }
 function studioJsonGeminiModel() {
@@ -1364,6 +1423,22 @@ function studioLlmOrderForPurpose(purpose) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/** Для tier=lite можно задать отдельный порядок (например сначала gemini flash). */
+function studioLlmOrderForCloud(purpose, tier) {
+  if (purpose !== 'json' && tier === 'lite') {
+    const raw = process.env.STUDIO_LLM_ORDER_STREAM_LITE?.trim();
+    if (raw) {
+      return raw
+        .toLowerCase()
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
+    return ['gemini', 'openai', 'anthropic'];
+  }
+  return studioLlmOrderForPurpose(purpose);
 }
 
 function studioLlmFallbackConfigured() {
@@ -1461,34 +1536,62 @@ async function studioLlmGeminiComplete(prompt, maxTokens, modelExplicit) {
   return parts.map((p) => (p && p.text ? String(p.text) : '')).join('').trim();
 }
 
-async function studioLlmCompleteCloud(prompt, maxTokens, purpose = 'stream') {
-  const order = studioLlmOrderForPurpose(purpose);
+async function studioLlmCompleteCloud(prompt, maxTokens, purpose = 'stream', tierOpt) {
+  const tier = purpose === 'json' ? 'standard' : tierOpt ?? estimateCloudTaskTier(prompt);
+  const effectiveMax =
+    tier === 'lite'
+      ? Math.min(maxTokens, Math.max(256, Number(process.env.STUDIO_CLOUD_MAX_TOKENS_LITE || 4096)))
+      : maxTokens;
+  const order = studioLlmOrderForCloud(purpose, tier);
   let lastErr = 'no_cloud_provider_configured';
   for (const p of order) {
     try {
       if (p === 'anthropic' && process.env.ANTHROPIC_API_KEY?.trim()) {
         const modelSel =
-          purpose === 'json' ? studioJsonAnthropicModel() : studioStreamAnthropicModel();
-        const t = await studioLlmAnthropicComplete(prompt, maxTokens, modelSel);
-        if (t != null) return { ok: true, text: t, provider: 'anthropic', model: modelSel };
+          purpose === 'json'
+            ? studioJsonAnthropicModel()
+            : tier === 'lite'
+              ? studioStreamAnthropicModelLite()
+              : studioStreamAnthropicModel();
+        const t = await studioLlmAnthropicComplete(prompt, effectiveMax, modelSel);
+        if (t != null) {
+          logAccess(`STUDIO_LLM_CLOUD_OK purpose=${purpose} tier=${tier} provider=anthropic model=${modelSel}`);
+          return { ok: true, text: t, provider: 'anthropic', model: modelSel, tier };
+        }
       } else if (p === 'openai' && process.env.OPENAI_API_KEY?.trim()) {
-        const modelSel = purpose === 'json' ? studioJsonOpenAiModel() : studioStreamOpenAiModel();
-        const t = await studioLlmOpenAiComplete(prompt, maxTokens, modelSel);
-        if (t != null) return { ok: true, text: t, provider: 'openai', model: modelSel };
+        const modelSel =
+          purpose === 'json'
+            ? studioJsonOpenAiModel()
+            : tier === 'lite'
+              ? studioStreamOpenAiModelLite()
+              : studioStreamOpenAiModel();
+        const t = await studioLlmOpenAiComplete(prompt, effectiveMax, modelSel);
+        if (t != null) {
+          logAccess(`STUDIO_LLM_CLOUD_OK purpose=${purpose} tier=${tier} provider=openai model=${modelSel}`);
+          return { ok: true, text: t, provider: 'openai', model: modelSel, tier };
+        }
       } else if (
         p === 'gemini' &&
         (process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY)?.trim()
       ) {
-        const modelSel = purpose === 'json' ? studioJsonGeminiModel() : studioStreamGeminiModel();
-        const t = await studioLlmGeminiComplete(prompt, maxTokens, modelSel);
-        if (t != null) return { ok: true, text: t, provider: 'gemini', model: modelSel };
+        const modelSel =
+          purpose === 'json'
+            ? studioJsonGeminiModel()
+            : tier === 'lite'
+              ? studioStreamGeminiModelLite()
+              : studioStreamGeminiModel();
+        const t = await studioLlmGeminiComplete(prompt, effectiveMax, modelSel);
+        if (t != null) {
+          logAccess(`STUDIO_LLM_CLOUD_OK purpose=${purpose} tier=${tier} provider=gemini model=${modelSel}`);
+          return { ok: true, text: t, provider: 'gemini', model: modelSel, tier };
+        }
       }
     } catch (e) {
       lastErr = String(e.message || e);
-      logError(`STUDIO_LLM_CLOUD_${purpose}_${p} ${lastErr}`);
+      logError(`STUDIO_LLM_CLOUD_${purpose}_${tier}_${p} ${lastErr}`);
     }
   }
-  return { ok: false, text: '', err: lastErr, provider: null, model: null };
+  return { ok: false, text: '', err: lastErr, provider: null, model: null, tier };
 }
 
 async function studioTryOllamaGenerateSingle(model, prompt) {
