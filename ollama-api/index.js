@@ -553,6 +553,11 @@ const STUDIO_DOCKER_IMAGE = (process.env.STUDIO_DOCKER_IMAGE || 'ollama-studio-r
 const STUDIO_BUILD_EXECUTOR = (process.env.STUDIO_BUILD_EXECUTOR || 'auto').toLowerCase();
 const STUDIO_DOCKER_MEMORY = (process.env.STUDIO_DOCKER_MEMORY || '2g').trim();
 const STUDIO_DOCKER_CPUS = (process.env.STUDIO_DOCKER_CPUS || '2').trim();
+/**
+ * npm ci требует полного совпадения package.json и lock. Агент правит зависимости — lock устаревает.
+ * По умолчанию для превью используем npm install. STUDIO_PREVIEW_USE_NPM_CI=1 — ci, если lock есть и санитизация не трогала package.json.
+ */
+const STUDIO_PREVIEW_USE_NPM_CI = String(process.env.STUDIO_PREVIEW_USE_NPM_CI || '').trim() === '1';
 /** TTL подписанной ссылки /preview/... (мс), план §5.4–5.5. */
 const STUDIO_PREVIEW_TTL_MS = Number(process.env.STUDIO_PREVIEW_TTL_MS || 45 * 60 * 1000);
 const STUDIO_MAX_BUILDS_GLOBAL = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_GLOBAL || 20));
@@ -673,6 +678,17 @@ function studioStripControlCharsFromPackageJsonStrings(pkg) {
   return changed;
 }
 
+/** Модель иногда пишет "a" - "b" в массиве вместо "a", "b". */
+function studioRepairHyphenBetweenJsonStrings(s) {
+  let t = s;
+  for (let i = 0; i < 32; i++) {
+    const next = t.replace(/("(?:[^"\\]|\\.)*")\s*-\s*("(?:[^"\\]|\\.)*")/g, '$1, $2');
+    if (next === t) break;
+    t = next;
+  }
+  return t;
+}
+
 /**
  * Если package.json битый (не парсится) — убираем управляющие символы из текста и перезаписываем.
  * Возвращает true, если файл изменён (нужен npm install, lock удаляется).
@@ -689,13 +705,20 @@ function studioRepairCorruptWorkspacePackageJson(wsRoot) {
     /* */
   }
   const stripped = raw.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
-  let pkg;
-  try {
-    pkg = JSON.parse(stripped);
-  } catch {
-    return false;
+  const candidates = [stripped, studioRepairHyphenBetweenJsonStrings(stripped)];
+  let pkg = null;
+  for (const body of candidates) {
+    try {
+      const p = JSON.parse(body);
+      if (p && typeof p === 'object') {
+        pkg = p;
+        break;
+      }
+    } catch {
+      /* */
+    }
   }
-  if (!pkg || typeof pkg !== 'object') return false;
+  if (!pkg) return false;
   studioStripControlCharsFromPackageJsonStrings(pkg);
   fs.writeFileSync(fp, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
   try {
@@ -726,6 +749,12 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
   for (const sec of sections) {
     const o = pkg[sec];
     if (!o || typeof o !== 'object') continue;
+    if (typeof o['licide-react'] === 'string') {
+      const v = o['licide-react'];
+      delete o['licide-react'];
+      if (typeof o['lucide-react'] !== 'string') o['lucide-react'] = v;
+      changed = true;
+    }
     if (typeof o['lucide-react'] !== 'string') continue;
     const cur = o['lucide-react'];
     if (studioLucideReactRangeLooksInvalid(cur)) {
@@ -1075,10 +1104,13 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
-  const useNpmInstall = pkgRepaired || pkgSanitized || !lockPresent;
+  const useNpmInstall =
+    !STUDIO_PREVIEW_USE_NPM_CI || pkgRepaired || pkgSanitized || !lockPresent;
   const headerExtra = [
+    !STUDIO_PREVIEW_USE_NPM_CI ? '[studio] npm install (по умолчанию: lock подстраивается под package.json)' : null,
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
-    pkgSanitized ? '[studio] скорректирован lucide-react в package.json; lock пересоздаётся' : null,
+    pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
+    lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
     .filter(Boolean)
@@ -1470,7 +1502,7 @@ function buildStudioJsonOpsPrompt({
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не используй корни node_modules, dist, .git, .vite.
-- В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET).
+- В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET). Имя пакета: **lucide-react**, не \`licide-react\`.
 - Версии в dependencies: только печатные символы, без управляющих Unicode (иначе npm не прочитает package.json).
 ${headLine}
 
@@ -1511,7 +1543,7 @@ function buildStudioBuildRecoveryPrompt({ headRevisionId, fileSummary, projectPl
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не трогай node_modules, dist, .git, .vite.
-- **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`.
+- **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`. Не пиши \`licide-react\` (опечатка).
 - Если не хватает lockfile — допусти правку только package.json; сервер сам выполнит npm install.
 - Строки версий в dependencies: только обычные printable-символы, **без** управляющих символов (0x00–0x1F).
 ${headLine}
