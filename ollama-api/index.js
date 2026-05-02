@@ -569,6 +569,15 @@ const STUDIO_AGENT_IMPLEMENT_MAX_OPS = Math.max(
   Math.min(STUDIO_WORKSPACE_PATCH_MAX_OPS, Number(process.env.STUDIO_AGENT_IMPLEMENT_MAX_OPS || 15)),
 );
 const STUDIO_AGENT_CODE_MODEL = (process.env.STUDIO_AGENT_CODE_MODEL || 'deepseek-coder:latest').trim();
+/** После ошибки сборки: сколько раз вызвать LLM-патч и повторить npm run build (0 — без автопочинки). */
+const STUDIO_BUILD_RECOVERY_MAX_ROUNDS = Math.max(
+  0,
+  Math.min(12, Number(process.env.STUDIO_BUILD_RECOVERY_MAX_ROUNDS ?? 3)),
+);
+const STUDIO_BUILD_RECOVERY_MAX_OPS = Math.max(
+  1,
+  Math.min(STUDIO_WORKSPACE_PATCH_MAX_OPS, Number(process.env.STUDIO_BUILD_RECOVERY_MAX_OPS ?? 25)),
+);
 /** Порядок облачных вызовов: см. STUDIO_LLM_ORDER_STREAM / STUDIO_LLM_ORDER_JSON / STUDIO_LLM_FALLBACK_ORDER в env. */
 const STUDIO_CLOUD_MAX_TOKENS = Math.min(
   32768,
@@ -983,6 +992,36 @@ async function persistStudioBuildResult(userId, projectId, ok, exitCode, log, ex
   });
 }
 
+async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor) {
+  const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+  const data = loadUserFile(userId);
+  const project = data.studioProjects.find((p) => p.id === projectId);
+  const planMd = project?.plan?.markdown || '';
+  if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
+
+  const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
+  const lockPresent = studioWorkspaceHasNpmLockfile(ws);
+  const useNpmInstall = pkgSanitized || !lockPresent;
+  const headerExtra = [
+    pkgSanitized ? '[studio] скорректирован lucide-react в package.json; lock пересоздаётся' : null,
+    !lockPresent && !pkgSanitized ? '[studio] нет package-lock.json — выполняется npm install' : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const header = `${headerExtra ? `${headerExtra}\n` : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
+  const npmInstallCmd = useNpmInstall
+    ? ['install', '--no-audit', '--no-fund']
+    : ['ci', '--no-audit', '--no-fund'];
+  const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
+  const r1Label = useNpmInstall ? '=== npm install ===' : '=== npm ci ===';
+  if (r1.code !== 0) {
+    return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
+  }
+  const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
+  const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
+  return { ok: r2.code === 0, exitCode: r2.code || 0, chunk: combined };
+}
+
 async function executeStudioPreviewBuild(userId, projectId) {
   const key = studioLockKey(userId, projectId);
   const executor = resolveStudioExecutor();
@@ -990,38 +1029,35 @@ async function executeStudioPreviewBuild(userId, projectId) {
     executor === 'docker'
       ? (cwd, args, ms) => runNpmInDocker(cwd, args, ms)
       : (cwd, args, ms) => runNpmInWorkspace(cwd, args, ms);
+  const logs = [];
   try {
-    const ws = ensureStudioWorkspaceScaffold(userId, projectId);
-    const data = loadUserFile(userId);
-    const project = data.studioProjects.find((p) => p.id === projectId);
-    const planMd = project?.plan?.markdown || '';
-    if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
-
-    const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
-    const lockPresent = studioWorkspaceHasNpmLockfile(ws);
-    const useNpmInstall = pkgSanitized || !lockPresent;
-    const headerExtra = [
-      pkgSanitized ? '[studio] скорректирован lucide-react в package.json; lock пересоздаётся' : null,
-      !lockPresent && !pkgSanitized ? '[studio] нет package-lock.json — выполняется npm install' : null,
-    ]
-      .filter(Boolean)
-      .join('\n');
-    const header = `${headerExtra ? `${headerExtra}\n` : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
-    const npmInstallCmd = useNpmInstall
-      ? ['install', '--no-audit', '--no-fund']
-      : ['ci', '--no-audit', '--no-fund'];
-    const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
-    if (r1.code !== 0) {
-      await persistStudioBuildResult(userId, projectId, false, r1.code, header + r1.log, executor);
-      return;
+    for (let recoveryRound = 0; ; recoveryRound += 1) {
+      const attempt = await runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor);
+      logs.push(`=== сборка (попытка ${recoveryRound + 1}) ===\n${attempt.chunk}`);
+      if (attempt.ok) {
+        await persistStudioBuildResult(userId, projectId, true, 0, logs.join('\n\n'), executor);
+        return;
+      }
+      if (recoveryRound >= STUDIO_BUILD_RECOVERY_MAX_ROUNDS) {
+        await persistStudioBuildResult(userId, projectId, false, attempt.exitCode, logs.join('\n\n'), executor);
+        return;
+      }
+      if (!studioLlmUpstreamAvailable()) {
+        logs.push('[studio] автопочинка пропущена: нет Ollama и облачных ключей для JSON-модели');
+        await persistStudioBuildResult(userId, projectId, false, attempt.exitCode, logs.join('\n\n'), executor);
+        return;
+      }
+      const rec = await studioTryRecoverWorkspaceFromBuildLog(userId, projectId, attempt.chunk);
+      logs.push(`=== агент: правки после ошибки (раунд ${recoveryRound + 1}) ===\n${rec.note}`);
+      if (!rec.applied) {
+        await persistStudioBuildResult(userId, projectId, false, attempt.exitCode, logs.join('\n\n'), executor);
+        return;
+      }
     }
-    const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
-    const r1Label = useNpmInstall ? '=== npm install ===' : '=== npm ci ===';
-    const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
-    await persistStudioBuildResult(userId, projectId, r2.code === 0, r2.code, combined, executor);
   } catch (e) {
     logError(`STUDIO_BUILD ${userId} ${projectId} ${e.stack || e.message}`);
-    await persistStudioBuildResult(userId, projectId, false, -2, String(e.message || e), executor);
+    logs.push(`[studio exception]\n${String(e.message || e)}`);
+    await persistStudioBuildResult(userId, projectId, false, -2, logs.join('\n\n'), executor);
   } finally {
     studioBuildInProgress.delete(key);
   }
@@ -1378,6 +1414,41 @@ ${truncateChars(String(projectPlan || ''), 4000)}
 ${truncateChars(String(narrative || ''), 8000)}
 
 Сгенерируй минимальный набор операций для Vite+React+TypeScript. Только JSON.`.trim();
+}
+
+function buildStudioBuildRecoveryPrompt({ headRevisionId, fileSummary, projectPlan, buildLogTail, maxOps }) {
+  const headLine = headRevisionId
+    ? `Текущий HEAD ревизии workspace: ${headRevisionId}. Поле base_revision_id в JSON должно совпадать с этим UUID.`
+    : `Ревизий HEAD нет — укажи base_revision_id как пустую строку "".`;
+  return `Ты отвечаешь ТОЛЬКО одним JSON-объектом (без Markdown, без текста до или после, без \`\`\`).
+
+Формат:
+{"base_revision_id":"<uuid или пустая строка>","operations":[...]}
+
+Сборка превью (npm install / npm run build) упала. По логу исправь проект **минимальными правками**, чтобы установка и \`vite build\` проходили без ошибок.
+
+Элементы operations (не больше ${maxOps}):
+- {"op":"write","path":"относительный/путь.ts","content_base64":"<base64 UTF-8>"}
+- {"op":"delete","path":"путь"}
+- {"op":"mkdir","path":"каталог"}
+
+Правила:
+- Пути POSIX, без ".." и без ведущего /.
+- Не трогай node_modules, dist, .git, .vite.
+- **lucide-react**: только \`^1.0.0\` или реальный 0.4xx (\`^0.469.0\`); не \`^0.5.0\`.
+- Если не хватает lockfile — допусти правку только package.json; сервер сам выполнит npm install.
+${headLine}
+
+Файлы workspace:
+${fileSummary}
+
+План проекта:
+${truncateChars(String(projectPlan || ''), 4000)}
+
+Лог сборки (ошибки npm / tsc / vite):
+${truncateChars(String(buildLogTail || ''), 12000)}
+
+Только JSON.`.trim();
 }
 
 function parseAgentWorkspaceOperations(raw) {
@@ -3119,6 +3190,67 @@ async function studioApplyWorkspacePatchTxn(userId, projectId, baseRevisionId, o
     logAccess(`STUDIO_WORKSPACE_PATCH user=${userId} project=${projectId} ops=${ops.length}`);
     return { code: 200, applied: ops.length };
   });
+}
+
+async function studioTryRecoverWorkspaceFromBuildLog(userId, projectId, buildLogText) {
+  let headRev = null;
+  let projectPlan = '';
+  await userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) return;
+    if (project.studioHeadRevisionId && isUuidLike(String(project.studioHeadRevisionId))) {
+      headRev = project.studioHeadRevisionId;
+    }
+    projectPlan = project.plan && typeof project.plan.markdown === 'string' ? project.plan.markdown : '';
+  });
+
+  const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+  const files = studioListWorkspaceFiles(ws);
+  const fileSummary = files.slice(0, 80).map((f) => f.path).join('\n') || '(пусто)';
+
+  const jsonPrompt = buildStudioBuildRecoveryPrompt({
+    headRevisionId: headRev,
+    fileSummary,
+    projectPlan,
+    buildLogTail: buildLogText,
+    maxOps: STUDIO_BUILD_RECOVERY_MAX_OPS,
+  });
+
+  const codeModel = ALLOWED_SET.has(STUDIO_AGENT_CODE_MODEL)
+    ? STUDIO_AGENT_CODE_MODEL
+    : await resolveModel('deepseek-coder:latest');
+
+  const gen2 = await studioGenerateSingleResponse(codeModel, jsonPrompt);
+  if (!gen2.ok) {
+    logAccess(`STUDIO_BUILD_RECOVERY_LLM_FAIL user=${userId} project=${projectId} ${gen2.err || ''}`);
+    return { applied: false, note: `LLM: ${gen2.err || 'json_failed'}` };
+  }
+
+  const parsed = parseAgentWorkspaceOperations(gen2.text);
+  if (!parsed.ok || parsed.operations.length === 0) {
+    return { applied: false, note: `Нет операций в ответе: ${parsed.err || 'empty'}` };
+  }
+
+  const ops = parsed.operations.slice(0, STUDIO_BUILD_RECOVERY_MAX_OPS);
+  const bodyBase = headRev || parsed.base_revision_id || null;
+  const patchOut = await studioApplyWorkspacePatchTxn(userId, projectId, bodyBase, ops);
+  if (patchOut.code !== 200) {
+    logAccess(
+      `STUDIO_BUILD_RECOVERY_PATCH_FAIL user=${userId} project=${projectId} ${patchOut.err || patchOut.code}`,
+    );
+    const extra =
+      patchOut.conflicts && patchOut.conflicts.length
+        ? ` ${JSON.stringify(patchOut.conflicts)}`
+        : '';
+    return {
+      applied: false,
+      note: `Патч отклонён: ${patchOut.err || patchOut.code}${extra}`,
+    };
+  }
+
+  logAccess(`STUDIO_BUILD_RECOVERY_OK user=${userId} project=${projectId} ops=${patchOut.applied}`);
+  return { applied: true, note: `Применено операций: ${patchOut.applied}. Повторная сборка…` };
 }
 
 /**
