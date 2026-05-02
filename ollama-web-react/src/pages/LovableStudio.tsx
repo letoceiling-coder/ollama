@@ -7,6 +7,8 @@ import {
   getStudioProject,
   getStudioProjects,
   postStudioPlan,
+  postStudioPreviewBuild,
+  studioPreviewUrl,
 } from '../api/studioClient';
 import type { StudioProject } from '../api/studioTypes';
 import { buildPlanOutlineFromUserPrompt } from '../studio/planOutline';
@@ -95,6 +97,7 @@ export function LovableStudio() {
     queryKey: projectId ? QK.project(projectId) : ['studio', 'project', 'none'],
     queryFn: () => getStudioProject(projectId!),
     enabled: !!projectId,
+    refetchInterval: (q) => (q.state.data?.taskStatus === 'building' ? 1500 : false),
   });
 
   const project = projectQuery.data;
@@ -130,7 +133,27 @@ export function LovableStudio() {
           id: crypto.randomUUID(),
           role: 'agent',
           content:
-            'План **согласован**. Дальше: реализация в workspace, `npm run build`, preview URL — по `lovable_plan.md` (фазы 2–3). Сейчас инфраструктура runner ещё не подключена; статус задачи: реализация.',
+            'План **согласован**. Нажмите **Собрать превью** слева: шаблон Vite в workspace, `npm ci` и `npm run build`; готовый билд откроется в превью.',
+        },
+      ]);
+    },
+    onError: (e: Error) => setFlowError(e.message),
+  });
+
+  const buildMu = useMutation({
+    mutationFn: (id: string) => postStudioPreviewBuild(id),
+    onSuccess: () => {
+      setFlowError(null);
+      void queryClient.invalidateQueries({ queryKey: QK.projects });
+      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      setPreviewKey((k) => k + 1);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'agent',
+          content:
+            'Сборка запущена. Дождитесь статуса «Проверка» — тогда превью подгрузится в iframe.',
         },
       ]);
     },
@@ -150,10 +173,15 @@ export function LovableStudio() {
     postPlanMu.mutate({ id: projectId, md });
   }, [draft, projectId, postPlanMu]);
 
-  const busy = postPlanMu.isPending || approveMu.isPending || createProjectMu.isPending;
+  const busy = postPlanMu.isPending || approveMu.isPending || createProjectMu.isPending || buildMu.isPending;
+
+  const iframeRealSrc =
+    project?.taskStatus === 'ready_for_review' && projectId
+      ? project.previewSharePath || studioPreviewUrl(projectId)
+      : null;
 
   return (
-    <div className="flex h-full min-h-[100dvh] flex-col bg-[radial-gradient(ellipse_at_top,_rgba(16,163,127,0.14),transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(120,80,220,0.1),transparent_52%)]">
+    <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-zinc-950 text-zinc-100">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] bg-black/30 px-4 py-3 backdrop-blur-xl md:px-6">
         <div className="flex min-w-0 items-center gap-3">
           <Link
@@ -246,9 +274,34 @@ export function LovableStudio() {
                   </button>
                 ) : null}
                 {project.plan.status === 'approved' ? (
-                  <p className="mt-3 text-[11px] text-emerald-200/90">
-                    Согласовано. Ожидается реализация и сборка в runner.
-                  </p>
+                  <div className="mt-3 space-y-2">
+                    <p className="text-[11px] text-emerald-200/90">Согласовано. Запустите сборку превью.</p>
+                    {project.taskStatus === 'failed' && project.lastBuild?.log ? (
+                      <details className="rounded border border-red-500/30 bg-red-950/30 p-2 text-[10px] text-red-100">
+                        <summary className="cursor-pointer font-medium">Лог ошибки сборки</summary>
+                        <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap text-zinc-300">
+                          {project.lastBuild.log.slice(-4000)}
+                        </pre>
+                      </details>
+                    ) : null}
+                    {(project.taskStatus === 'implementing' ||
+                      project.taskStatus === 'building' ||
+                      project.taskStatus === 'failed' ||
+                      project.taskStatus === 'ready_for_review') ? (
+                      <button
+                        type="button"
+                        disabled={busy || project.taskStatus === 'building'}
+                        onClick={() => projectId && buildMu.mutate(projectId)}
+                        className="w-full rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 text-sm font-medium text-sky-100 transition hover:bg-sky-500/25 disabled:opacity-40"
+                      >
+                        {project.taskStatus === 'building'
+                          ? 'Сборка…'
+                          : project.taskStatus === 'ready_for_review'
+                            ? 'Пересобрать превью'
+                            : 'Собрать превью'}
+                      </button>
+                    ) : null}
+                  </div>
                 ) : null}
               </div>
             ) : (
@@ -271,18 +324,17 @@ export function LovableStudio() {
           <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-white/[0.06] bg-black/15 px-3 py-2 md:px-4">
             <span className="text-[11px] text-zinc-500">Превью</span>
             <code className="truncate rounded-md bg-black/40 px-2 py-1 font-mono text-[11px] text-emerald-200/90 ring-1 ring-white/10">
-            {project?.plan?.status === 'approved' || project?.taskStatus === 'implementing'
-                ? '(скоро) preview после build'
-                : '—'}
+              {iframeRealSrc || '—'}
             </code>
           </div>
           <div className="relative min-h-[240px] flex-1 bg-zinc-950/80 p-3 md:p-4">
             <iframe
-              key={previewKey}
+              key={`${previewKey}-${iframeRealSrc ?? 'demo'}`}
               title="Превью проекта"
               className="h-full min-h-[220px] w-full rounded-xl border border-white/10 bg-black shadow-inner shadow-black/40"
-              sandbox="allow-scripts allow-forms allow-popups-to-escape-sandbox"
-              srcDoc={previewSrcDoc}
+              sandbox="allow-scripts allow-same-origin allow-forms allow-popups-to-escape-sandbox"
+              src={iframeRealSrc ?? undefined}
+              srcDoc={iframeRealSrc ? undefined : previewSrcDoc}
             />
           </div>
           <div className="shrink-0 border-t border-white/[0.06] bg-black/25 px-3 py-3 md:px-4">

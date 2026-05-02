@@ -7,6 +7,7 @@ const path = require('path');
 const express = require('express');
 const crypto = require('crypto');
 const readline = require('readline');
+const { spawn, spawnSync } = require('child_process');
 const { Readable } = require('stream');
 const multer = require('multer');
 
@@ -141,6 +142,9 @@ function loadUserFile(userId) {
         if (typeof p.plan.updatedAt !== 'number') p.plan.updatedAt = 0;
       }
       if (typeof p.taskStatus !== 'string') p.taskStatus = 'idle';
+      if (typeof p.previewShareExpiresAt !== 'number' || !Number.isFinite(p.previewShareExpiresAt)) {
+        delete p.previewShareExpiresAt;
+      }
     }
     return raw;
   } catch {
@@ -530,8 +534,261 @@ const errorPath = path.join(logsDir, 'error.log');
 
 const DATA_USERS_DIR = path.join(__dirname, 'data', 'users');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
+/** Фаза 2: рабочие копии превью (не коммитить). Сборка в Docker — см. `studio-runner/Dockerfile`. */
+const STUDIO_WORKSPACES_ROOT = path.join(__dirname, 'data', 'studio-workspaces');
+const STUDIO_TEMPLATE_DIR = path.join(__dirname, 'studio-template');
+const STUDIO_BUILD_TIMEOUT_MS = Number(process.env.STUDIO_BUILD_TIMEOUT_MS || 600000);
+const STUDIO_DOCKER_IMAGE = (process.env.STUDIO_DOCKER_IMAGE || 'ollama-studio-runner:local').trim();
+/** `auto` | `docker` | `host` — в `auto` при доступном Docker используется контейнер. */
+const STUDIO_BUILD_EXECUTOR = (process.env.STUDIO_BUILD_EXECUTOR || 'auto').toLowerCase();
+const STUDIO_DOCKER_MEMORY = (process.env.STUDIO_DOCKER_MEMORY || '2g').trim();
+const STUDIO_DOCKER_CPUS = (process.env.STUDIO_DOCKER_CPUS || '2').trim();
+/** TTL подписанной ссылки /preview/... (мс), план §5.4–5.5. */
+const STUDIO_PREVIEW_TTL_MS = Number(process.env.STUDIO_PREVIEW_TTL_MS || 45 * 60 * 1000);
+const STUDIO_MAX_BUILDS_GLOBAL = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_GLOBAL || 20));
+const STUDIO_MAX_BUILDS_PER_USER = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_PER_USER || 2));
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
+
+/** @type {Set<string>} */
+const studioBuildInProgress = new Set();
+
+function studioLockKey(userId, projectId) {
+  return `${userId}:${projectId}`;
+}
+
+function studioWorkspaceDir(userId, projectId) {
+  return path.join(STUDIO_WORKSPACES_ROOT, userId, projectId);
+}
+
+function ensureStudioWorkspaceScaffold(userId, projectId) {
+  const ws = studioWorkspaceDir(userId, projectId);
+  const marker = path.join(ws, 'package.json');
+  if (fs.existsSync(marker)) return ws;
+  fs.mkdirSync(ws, { recursive: true });
+  if (!fs.existsSync(STUDIO_TEMPLATE_DIR)) {
+    throw new Error('studio_template_missing');
+  }
+  fs.cpSync(STUDIO_TEMPLATE_DIR, ws, {
+    recursive: true,
+    filter: (src) => {
+      const normalized = src.replace(/\\/g, '/');
+      return !normalized.includes('/node_modules/') && !normalized.endsWith('/node_modules');
+    },
+  });
+  return ws;
+}
+
+/** Путь тома для `docker -v` (Windows → стиль /c/... для Docker Desktop). */
+function hostPathForDockerVolume(absPath) {
+  const abs = path.resolve(absPath);
+  if (process.platform !== 'win32') return abs;
+  const m = /^([A-Za-z]):[/\\](.*)$/.exec(abs);
+  if (!m) return abs;
+  const rest = m[2].split(/[/\\]/).filter(Boolean).join('/');
+  return `/${m[1].toLowerCase()}/${rest}`;
+}
+
+function dockerDaemonReachable() {
+  try {
+    const r = spawnSync('docker', ['info'], {
+      stdio: 'ignore',
+      timeout: 12000,
+      encoding: 'utf8',
+    });
+    return r.status === 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** @returns {'docker' | 'host'} */
+function resolveStudioExecutor() {
+  if (STUDIO_BUILD_EXECUTOR === 'host') return 'host';
+  if (STUDIO_BUILD_EXECUTOR === 'docker') {
+    if (!dockerDaemonReachable()) {
+      logError('STUDIO_BUILD_EXECUTOR=docker but Docker is not available; falling back to host npm');
+      return 'host';
+    }
+    return 'docker';
+  }
+  if (dockerDaemonReachable()) return 'docker';
+  return 'host';
+}
+
+function runNpmInDocker(cwd, npmArgs, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const mountSrc = hostPathForDockerVolume(cwd);
+    const dockerArgs = ['run', '--rm'];
+    const dockerNet = (process.env.STUDIO_DOCKER_NETWORK || '').trim();
+    if (dockerNet) dockerArgs.push('--network', dockerNet);
+    dockerArgs.push(
+      '--pull',
+      'missing',
+      '-v',
+      `${mountSrc}:/workspace`,
+      '-w',
+      '/workspace',
+      '--memory',
+      STUDIO_DOCKER_MEMORY,
+      '--cpus',
+      STUDIO_DOCKER_CPUS,
+      '--pids-limit',
+      '256',
+      '--security-opt',
+      'no-new-privileges',
+      '--cap-drop',
+      'ALL',
+      '-e',
+      'CI=1',
+      '-e',
+      'NPM_CONFIG_UPDATE_NOTIFIER=false',
+      STUDIO_DOCKER_IMAGE,
+      'npm',
+      ...npmArgs,
+    );
+    const child = spawn('docker', dockerArgs, {
+      shell: false,
+      env: process.env,
+    });
+    let log = '';
+    const push = (d) => {
+      log += d.toString();
+      if (log.length > 200000) log = log.slice(-100000);
+    };
+    child.stdout.on('data', push);
+    child.stderr.on('data', push);
+    const t = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch (_) {
+            /* ignore */
+          }
+        }, 8000);
+      } catch (_) {
+        /* ignore */
+      }
+      resolve({ code: -1, log: `${log}\n[studio docker build timeout ${timeoutMs}ms]` });
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(t);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(t);
+      resolve({ code: code ?? -1, log });
+    });
+  });
+}
+
+function runNpmInWorkspace(cwd, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const child = spawn(cmd, args, {
+      cwd,
+      shell: false,
+      env: { ...process.env, CI: '1' },
+    });
+    let log = '';
+    const push = (d) => {
+      log += d.toString();
+      if (log.length > 200000) log = log.slice(-100000);
+    };
+    child.stdout.on('data', push);
+    child.stderr.on('data', push);
+    const t = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+        setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch (_) {
+            /* ignore */
+          }
+        }, 8000);
+      } catch (_) {
+        /* ignore */
+      }
+      resolve({ code: -1, log: `${log}\n[studio build timeout ${timeoutMs}ms]` });
+    }, timeoutMs);
+    child.on('error', (err) => {
+      clearTimeout(t);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(t);
+      resolve({ code: code ?? -1, log });
+    });
+  });
+}
+
+function studioWritePlanArtifact(userId, projectId, markdown) {
+  const ws = studioWorkspaceDir(userId, projectId);
+  fs.mkdirSync(ws, { recursive: true });
+  fs.writeFileSync(
+    path.join(ws, 'STUDIO_PLAN.md'),
+    String(markdown || '').slice(0, 100000),
+    'utf8',
+  );
+}
+
+async function persistStudioBuildResult(userId, projectId, ok, exitCode, log, executor) {
+  await userTxn(userId, async () => {
+    const data = loadUserFile(userId);
+    const p = data.studioProjects.find((x) => x.id === projectId);
+    if (!p) return;
+    p.lastBuild = {
+      at: Date.now(),
+      ok: !!ok,
+      exitCode,
+      executor: executor === 'docker' || executor === 'host' ? executor : undefined,
+      log: String(log || '').slice(-14000),
+    };
+    p.taskStatus = ok ? 'ready_for_review' : 'failed';
+    p.updatedAt = Date.now();
+    if (ok) {
+      p.previewShareExpiresAt = Date.now() + STUDIO_PREVIEW_TTL_MS;
+    } else {
+      delete p.previewShareExpiresAt;
+    }
+    saveUserFile(userId, data);
+  });
+}
+
+async function executeStudioPreviewBuild(userId, projectId) {
+  const key = studioLockKey(userId, projectId);
+  const executor = resolveStudioExecutor();
+  const runNpm =
+    executor === 'docker'
+      ? (cwd, args, ms) => runNpmInDocker(cwd, args, ms)
+      : (cwd, args, ms) => runNpmInWorkspace(cwd, args, ms);
+  try {
+    const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+    const data = loadUserFile(userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    const planMd = project?.plan?.markdown || '';
+    if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
+
+    const header = `[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
+    const r1 = await runNpm(ws, ['ci', '--no-audit', '--no-fund'], STUDIO_BUILD_TIMEOUT_MS);
+    if (r1.code !== 0) {
+      await persistStudioBuildResult(userId, projectId, false, r1.code, header + r1.log, executor);
+      return;
+    }
+    const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
+    const combined = `${header}=== npm ci ===\n${r1.log}\n=== npm run build ===\n${r2.log}`;
+    await persistStudioBuildResult(userId, projectId, r2.code === 0, r2.code, combined, executor);
+  } catch (e) {
+    logError(`STUDIO_BUILD ${userId} ${projectId} ${e.stack || e.message}`);
+    await persistStudioBuildResult(userId, projectId, false, -2, String(e.message || e), executor);
+  } finally {
+    studioBuildInProgress.delete(key);
+  }
+}
 
 function writeLine(file, line) {
   fs.appendFile(file, `${new Date().toISOString()} ${line}\n`, (err) => {
@@ -545,6 +802,75 @@ function logAccess(line) {
 
 function logError(line) {
   writeLine(errorPath, line);
+}
+
+let studioPreviewSecretCached = null;
+function studioPreviewSecret() {
+  if (studioPreviewSecretCached) return studioPreviewSecretCached;
+  let s = String(process.env.STUDIO_PREVIEW_SECRET || '').trim();
+  if (s.length < 16) {
+    s = crypto.randomBytes(32).toString('hex');
+    console.warn(
+      '[studio] STUDIO_PREVIEW_SECRET unset or short; using ephemeral secret (restart invalidates /preview links). Set STUDIO_PREVIEW_SECRET in production.',
+    );
+  }
+  studioPreviewSecretCached = s;
+  return studioPreviewSecretCached;
+}
+
+/** @param {{ u: string, p: string, e: number }} payload */
+function signStudioPreviewToken(payload) {
+  const tw = JSON.stringify(payload);
+  const payloadB64 = Buffer.from(tw, 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', studioPreviewSecret()).update(payloadB64).digest('base64url');
+  return `${payloadB64}.${sig}`;
+}
+
+/** @returns {{ userId: string, projectId: string, exp: number } | null} */
+function verifyStudioPreviewToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const i = token.lastIndexOf('.');
+  if (i <= 0) return null;
+  const payloadB64 = token.slice(0, i);
+  const sig = token.slice(i + 1);
+  const expected = crypto.createHmac('sha256', studioPreviewSecret()).update(payloadB64).digest('base64url');
+  const sb = Buffer.from(sig, 'utf8');
+  const eb = Buffer.from(expected, 'utf8');
+  if (sb.length !== eb.length || !crypto.timingSafeEqual(sb, eb)) return null;
+  try {
+    const obj = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    if (!obj || typeof obj !== 'object') return null;
+    if (!isUuidLike(obj.u) || !isUuidLike(obj.p) || typeof obj.e !== 'number') return null;
+    if (Date.now() > obj.e) return null;
+    return { userId: obj.u, projectId: obj.p, exp: obj.e };
+  } catch (_) {
+    return null;
+  }
+}
+
+function enrichStudioProjectForClient(userId, project) {
+  const exp = project.previewShareExpiresAt;
+  const o = JSON.parse(JSON.stringify(project));
+  delete o.previewShareExpiresAt;
+  if (project.taskStatus === 'ready_for_review' && typeof exp === 'number' && exp > Date.now()) {
+    o.previewSharePath = `/preview/${signStudioPreviewToken({ u: userId, p: project.id, e: exp })}/`;
+  } else {
+    o.previewSharePath = null;
+  }
+  return o;
+}
+
+function studioActiveBuildCountGlobal() {
+  return studioBuildInProgress.size;
+}
+
+function studioActiveBuildCountForUser(userId) {
+  const prefix = `${userId}:`;
+  let n = 0;
+  for (const k of studioBuildInProgress) {
+    if (k.startsWith(prefix)) n += 1;
+  }
+  return n;
 }
 
 function maskKey(key) {
@@ -1057,7 +1383,9 @@ app.delete('/api/chats/:chatId', async (req, res) => {
 app.get('/api/studio/projects', (req, res) => {
   try {
     const data = loadUserFile(req.userId);
-    res.json({ projects: data.studioProjects });
+    res.json({
+      projects: data.studioProjects.map((p) => enrichStudioProjectForClient(req.userId, p)),
+    });
   } catch (e) {
     logError(`STUDIO_PROJECTS_GET ${req.userId} ${e.message}`);
     res.status(500).json({ error: 'storage_error' });
@@ -1092,7 +1420,7 @@ app.post('/api/studio/projects', async (req, res) => {
       saveUserFile(req.userId, data);
     });
     logAccess(`STUDIO_PROJECT_CREATE user=${req.userId} id=${project.id}`);
-    res.status(201).json({ project });
+    res.status(201).json({ project: enrichStudioProjectForClient(req.userId, project) });
   } catch (e) {
     logError(`STUDIO_PROJECTS_POST ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
@@ -1112,7 +1440,7 @@ app.get('/api/studio/projects/:projectId', (req, res) => {
       res.status(404).json({ error: 'not_found' });
       return;
     }
-    res.json({ project });
+    res.json({ project: enrichStudioProjectForClient(req.userId, project) });
   } catch (e) {
     logError(`STUDIO_PROJECT_GET ${req.userId} ${e.message}`);
     res.status(500).json({ error: 'storage_error' });
@@ -1157,7 +1485,7 @@ app.patch('/api/studio/projects/:projectId', async (req, res) => {
       res.status(400).json({ error: out.err || 'bad_request' });
       return;
     }
-    res.json({ project: out.project });
+    res.json({ project: enrichStudioProjectForClient(req.userId, out.project) });
   } catch (e) {
     logError(`STUDIO_PROJECT_PATCH ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
@@ -1225,7 +1553,7 @@ app.post('/api/studio/projects/:projectId/plan', async (req, res) => {
       res.status(404).json({ error: 'not_found' });
       return;
     }
-    res.json({ project: out.project });
+    res.json({ project: enrichStudioProjectForClient(req.userId, out.project) });
   } catch (e) {
     logError(`STUDIO_PLAN_POST ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
@@ -1266,12 +1594,144 @@ app.post('/api/studio/projects/:projectId/plan/approve', async (req, res) => {
       res.status(409).json({ error: 'plan_not_awaiting_approval', planStatus: out.planStatus });
       return;
     }
-    res.json({ project: out.project });
+    res.json({ project: enrichStudioProjectForClient(req.userId, out.project) });
   } catch (e) {
     logError(`STUDIO_PLAN_APPROVE ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
   }
 });
+
+/** Фаза 2 (MVP): фоновая сборка static preview из шаблона Vite в workspace; Docker/nginx-map — эволюция. */
+app.post('/api/studio/projects/:projectId/studio-build', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const key = studioLockKey(req.userId, projectId);
+  if (studioBuildInProgress.has(key)) {
+    res.status(409).json({ error: 'build_in_progress' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (project.plan.status !== 'approved') {
+      res.status(409).json({ error: 'plan_not_approved' });
+      return;
+    }
+    if (studioActiveBuildCountGlobal() >= STUDIO_MAX_BUILDS_GLOBAL) {
+      res.status(429).json({ error: 'builds_queue_full_global' });
+      return;
+    }
+    if (studioActiveBuildCountForUser(req.userId) >= STUDIO_MAX_BUILDS_PER_USER) {
+      res.status(429).json({ error: 'builds_queue_full_user' });
+      return;
+    }
+    studioBuildInProgress.add(key);
+    await userTxn(req.userId, async () => {
+      const d = loadUserFile(req.userId);
+      const p = d.studioProjects.find((x) => x.id === projectId);
+      if (!p) return;
+      p.taskStatus = 'building';
+      p.updatedAt = Date.now();
+      saveUserFile(req.userId, d);
+    });
+    logAccess(`STUDIO_PREVIEW_BUILD_QUEUED user=${req.userId} project=${projectId}`);
+    res.status(202).json({ accepted: true });
+    setImmediate(() => {
+      void executeStudioPreviewBuild(req.userId, projectId);
+    });
+  } catch (e) {
+    studioBuildInProgress.delete(key);
+    logError(`STUDIO_PREVIEW_BUILD_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/**
+ * Публичное превью по подписанному токену (план §5.4 path-based). Без cookie: только GET статики dist.
+ * nginx: location /preview/ → proxy_pass на этот же процесс.
+ */
+app.use('/preview', (req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.status(405).type('text/plain; charset=utf-8').send('Method not allowed');
+    return;
+  }
+  const fullUrl = req.url || '/';
+  const qIdx = fullUrl.indexOf('?');
+  const pathOnly = qIdx === -1 ? fullUrl : fullUrl.slice(0, qIdx);
+  const qs = qIdx === -1 ? '' : fullUrl.slice(qIdx);
+  const m = pathOnly.match(/^\/([^/]+)(\/.*)?$/);
+  if (!m) {
+    res.status(404).type('text/plain; charset=utf-8').send('Not found');
+    return;
+  }
+  const token = m[1];
+  const rel = m[2] && m[2].length > 0 ? m[2] : '/';
+  const decoded = verifyStudioPreviewToken(token);
+  if (!decoded) {
+    res
+      .status(404)
+      .type('text/plain; charset=utf-8')
+      .send('Ссылка недействительна или срок действия истёк.');
+    return;
+  }
+  const root = path.join(STUDIO_WORKSPACES_ROOT, decoded.userId, decoded.projectId, 'dist');
+  if (!fs.existsSync(path.join(root, 'index.html'))) {
+    res.status(404).type('text/plain; charset=utf-8').send('Превью не собрано.');
+    return;
+  }
+  req.url = rel + qs;
+  express.static(root, { index: false, fallthrough: true })(req, res, (err) => {
+    if (err) return next(err);
+    if (res.writableEnded || res.headersSent) return undefined;
+    if (req.method === 'HEAD') {
+      res.status(200).end();
+      return undefined;
+    }
+    return res.sendFile(path.join(root, 'index.html'), (e) => (e ? next(e) : undefined));
+  });
+});
+
+/** Раздача собранного dist. */
+app.use(
+  '/api/studio/projects/:projectId/preview',
+  (req, res, next) => {
+    try {
+      const { projectId } = req.params;
+      if (!isUuidLike(projectId)) {
+        res.status(400).json({ error: 'bad_id' });
+        return;
+      }
+      const data = loadUserFile(req.userId);
+      if (!data.studioProjects.some((p) => p.id === projectId)) {
+        res.status(404).json({ error: 'not_found' });
+        return;
+      }
+      const root = path.join(STUDIO_WORKSPACES_ROOT, req.userId, projectId, 'dist');
+      if (!fs.existsSync(path.join(root, 'index.html'))) {
+        res
+          .status(404)
+          .type('text/plain; charset=utf-8')
+          .send('Превью недоступно: выполните «Собрать превью».');
+        return;
+      }
+      req.studioPreviewRoot = root;
+      next();
+    } catch (e) {
+      logError(`STUDIO_PREVIEW_GATE ${e.message}`);
+      res.status(500).end();
+    }
+  },
+  (req, res, next) => {
+    express.static(req.studioPreviewRoot, { index: 'index.html' })(req, res, next);
+  },
+);
 
 app.post(
   '/api/upload',

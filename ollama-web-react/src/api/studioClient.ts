@@ -72,3 +72,31 @@ export async function approveStudioPlan(projectId: string): Promise<StudioProjec
   );
   return d.project;
 }
+
+/** Фаза 2: очередь сборки static preview (202 Accepted). */
+export async function postStudioPreviewBuild(projectId: string): Promise<{ accepted: boolean }> {
+  const r = await fetch(
+    `/api/studio/projects/${encodeURIComponent(projectId)}/studio-build`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    },
+  );
+  if (r.status === 202) {
+    return (await r.json()) as { accepted: boolean };
+  }
+  let detail = r.statusText;
+  try {
+    const body = await r.json();
+    detail = (body as { error?: string }).error || JSON.stringify(body);
+  } catch {
+    /* ignore */
+  }
+  throw new Error(`${r.status}: ${detail}`);
+}
+
+export function studioPreviewUrl(projectId: string): string {
+  return `/api/studio/projects/${encodeURIComponent(projectId)}/preview/`;
+}

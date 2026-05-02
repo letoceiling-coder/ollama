@@ -25,4 +25,16 @@ export interface StudioProject {
   updatedAt: number;
   plan: StudioPlan;
   taskStatus: StudioTaskStatus;
+  lastBuild?: StudioLastBuild;
+  /** Подписанная ссылка /preview/.../ для iframe и шаринга (TTL на сервере). */
+  previewSharePath?: string | null;
+}
+
+export interface StudioLastBuild {
+  at: number;
+  ok: boolean;
+  exitCode: number;
+  /** Как выполнялась сборка: контейнер или хост (см. STUDIO_BUILD_EXECUTOR). */
+  executor?: 'docker' | 'host';
+  log: string;
 }

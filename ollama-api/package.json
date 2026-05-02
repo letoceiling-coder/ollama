@@ -8,7 +8,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "studio-runner:build": "docker build -t ollama-studio-runner:local ./studio-runner"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

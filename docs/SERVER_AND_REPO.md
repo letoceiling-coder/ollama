@@ -20,7 +20,8 @@
 
 | Путь на VPS | Назначение |
 |-------------|------------|
-| `/var/www/ollama-api` | **Продакшен API** — Express (`index.js`), `package.json`, `.env`, `data/users/*.json`, `uploads/`, `logs/`. systemd: `ollama-api.service`, пользователь `www-data`. |
+| `/var/www/ollama` | **Git clone монорепозитория** `git@github.com:letoceiling-coder/ollama.git` — единый источник кода на сервере (рекомендуется). |
+| `/var/www/ollama-api` | **Продакшен API** — Express; предпочтительно **симлинк** на `/var/www/ollama/ollama-api`, иначе отдельная копия + ручной sync. Файлы **не в Git:** `.env`, `data/users/`, `uploads/`, `logs/`. systemd: `ollama-api.service`, пользователь `www-data`. |
 | `/var/www/ollama-web-react` | **Статика SPA** (результат `npm run build`), только `index.html` + `assets/`. Nginx: `root` для `location /`. |
 | `/var/www/ollama-web` | **Устаревший** вариант — один `index.html` (старый чат без React). На прод сейчас не используется как основной UI. |
 | `/var/www/ollama.site-al.ru` | Почти пусто — только каталог для **ACME** `/.well-known` в HTTP-сервере. |
@@ -35,39 +36,79 @@
 
 ## Сервисы и расписания
 
-- **`ollama-api.service`**: `WorkingDirectory=/var/www/ollama-api`, `EnvironmentFile=.env`, `ExecStart=node index.js`.
+- **`ollama-api.service`**: `WorkingDirectory=/var/www/ollama-api` (или `/var/www/ollama/ollama-api` при прямом пути), `EnvironmentFile=.env`, `ExecStart=node index.js`.
 - В **cron** root задач под этот проект **нет** — только другие сайты (AL, parser-tg, neeklo, ai.site-al.ru и т.д.).
 
 ---
 
-## Рекомендуемая структура Git (монорепозиторий)
+## Git: единый источник правды
 
-Имеет смысл держать **один** репозиторий с явными ролями каталогов:
+**Удалённый репозиторий:** `git@github.com:letoceiling-coder/ollama.git`  
+**Ветка:** `main`. Локальная рабочая копия и коммиты — в корне монорепо; на проде код обновляется **только** через `git pull` (без ручного расхождения «сервер vs Git»).
+
+Роли каталогов:
 
 ```
-ollama-api/           # Исходник шлюза (как на VPS); деплой в /var/www/ollama-api
-ollama-web-react/     # Исходник фронта (Vite + React); деплой: dist → /var/www/ollama-web-react
-ollama-web-chat/      # Опционально: старый одностраничный HTML-чат (история/референс)
-deploy/               # Снимки nginx (и при необходимости phase-конфиги)
-windows-autostart/    # Автозапуск Ollama + reverse SSH на Windows (домашний ПК)
-scripts/              # Вспомогательные скрипты (туннель и т.п.)
-docs/                 # Документация (этот файл)
-ssh-install-key/      # Утилита установки ключа (только исходники .cs/.csproj)
-lovable_plan.md       # Продуктовый план
-.env.example          # Шаблон переменных (корень или дублировать из ollama-api)
+ollama-api/           # Шлюз Express
+ollama-web-react      # SPA (Vite + React) — на прод выкладывается только dist/
+deploy/               # nginx, скрипты деплоя (`git-deploy-vps.sh`)
+docs/                 # Документация
+lovable_plan.md
+.env.example
 ```
 
-**Не коммитить:** `.env`, `node_modules/`, `dist/` (собирается при деплое), `api/data/users/*.json`, логи, загрузки, архивы `*.tgz`, временные JSON с ключами.
+**В Git не попадают** (см. корневой `.gitignore`): `.env`, `node_modules/`, `ollama-web-react/dist/`, `ollama-api/data/users/*.json`, `ollama-api/data/studio-workspaces/`, логи и загрузки API.
 
-**Устаревшие дубликаты (локально):** каталог **`api/`** с тем же `index.js`, что и `ollama-api/`, и закоммиченная раньше **`frontend/`** как копия `dist` — в пользу структуры выше их лучше **убрать из репозитория** и ориентироваться на `ollama-api/` + сборку `ollama-web-react`.
+### Первичная настройка VPS под Git
 
-**Имя файла nginx в `deploy/`:** на сервере файл называется `ollama.site-al.ru`; в репозитории достаточно одной копии — `deploy/ollama.site-al.ru.conf` (дубликат с другим именем удалить).
+Один раз на сервере (от root), с **бэкапом** текущих `data/` и `.env`:
 
----
+```bash
+# пример: бэкап старого API
+mv /var/www/ollama-api /var/www/ollama-api.bak-$(date +%Y%m%d)
 
-## Чек-лист деплоя после `git pull`
+cd /var/www
+git clone git@github.com:letoceiling-coder/ollama.git ollama
+cd ollama && git checkout main
 
-1. `ollama-api`: `npm ci`, при необходимости миграции данных — не трогать `data/users` на проде без бэкапа.
-2. `ollama-web-react`: `npm ci && npm run build`, затем синхронизация `dist/` → `/var/www/ollama-web-react/`.
-3. `systemctl restart ollama-api` при смене кода или `.env`.
-4. Домашний ПК: Ollama запущен, туннель активен — иначе `/api` и модели недоступны.
+# симлинк — systemd и привычные пути не меняются
+ln -sfn /var/www/ollama/ollama-api /var/www/ollama-api
+
+# восстановить данные и секреты (не из Git!)
+mkdir -p /var/www/ollama-api/data/users
+cp -a /var/www/ollama-api.bak-*/data/users/. /var/www/ollama-api/data/users/ 2>/dev/null || true
+cp /var/www/ollama-api.bak-*/.env /var/www/ollama-api/.env 2>/dev/null || true
+chown -R www-data:www-data /var/www/ollama-api/data /var/www/ollama-api/uploads /var/www/ollama-api/logs 2>/dev/null || true
+```
+
+Синхронизировать **`deploy/ollama.site-al.ru.conf`** с `/etc/nginx/sites-available/ollama.site-al.ru`, затем `nginx -t && systemctl reload nginx`.
+
+Пользователь **`www-data`** в группе **`docker`**, если используется Docker-сборка студии.
+
+### Деплой после изменений в Git
+
+На сервере:
+
+```bash
+cd /var/www/ollama
+chmod +x deploy/git-deploy-vps.sh
+./deploy/git-deploy-vps.sh
+```
+
+Скрипт выполняет: `git pull --ff-only`, `npm ci` в API и фронте, `npm run build` SPA, `rsync` в `/var/www/ollama-web-react/`, `npm run studio-runner:build` при наличии Docker, `systemctl restart ollama-api`.
+
+Переменные окружения: `REPO` (по умолчанию `/var/www/ollama`), `WEB_OUT` (по умолчанию `/var/www/ollama-web-react`), `BRANCH` (по умолчанию `main`).
+
+**Локально перед push:** в корне `npm run build` в `ollama-web-react` по желанию — на проде сборка всегда повторяется скриптом.
+
+### Студия (фаза 2): `STUDIO_PREVIEW_SECRET` и nginx `/preview/`
+
+В **`/var/www/ollama-api/.env`** (файл на сервере, не в Git) задайте устойчивый **`STUDIO_PREVIEW_SECRET`** (`openssl rand -hex 32`). В nginx должен быть блок **`location /preview/`** из **`deploy/ollama.site-al.ru.conf`**. Дополнительно: **`deploy/apply-studio-on-vps.sh`** — разовая подводка окружения.
+
+### Синхронизация с удалённым репозиторием без расхождений
+
+- Разработка и коммиты — **только в локальном clone**, затем **`git push origin main`**.
+- На VPS — только **`git pull --ff-only`** (или скрипт деплоя); правки кода напрямую на сервере **не вносить** (иначе снова появится расхождение).
+- Если история на GitHub должна полностью совпасть с локальной: на свой страх и риск **`git push --force-with-lease origin main`** (после согласования с командой).
+
+**Домашний ПК:** Ollama и SSH-туннель на `127.0.0.1:11434` на VPS должны быть активны — иначе чат и модели с прода не работают (см. раздел «Как устроен доступ к Ollama» выше).

@@ -18,6 +18,11 @@ export default defineConfig({
         changeOrigin: true,
         secure: apiTarget.startsWith('https'),
       },
+      '/preview': {
+        target: apiTarget,
+        changeOrigin: true,
+        secure: apiTarget.startsWith('https'),
+      },
     },
   },
 });
