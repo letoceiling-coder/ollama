@@ -123,14 +123,28 @@ function userTxn(userId, fn) {
 
 function loadUserFile(userId) {
   const fp = path.join(DATA_USERS_DIR, `${userId}.json`);
-  if (!fs.existsSync(fp)) return { chats: [] };
+  if (!fs.existsSync(fp)) return { chats: [], studioProjects: [] };
   try {
     const raw = JSON.parse(fs.readFileSync(fp, 'utf8'));
-    if (!raw || typeof raw !== 'object') return { chats: [] };
+    if (!raw || typeof raw !== 'object') return { chats: [], studioProjects: [] };
     if (!Array.isArray(raw.chats)) raw.chats = [];
+    if (!Array.isArray(raw.studioProjects)) raw.studioProjects = [];
+    for (const p of raw.studioProjects) {
+      if (!p || typeof p !== 'object') continue;
+      if (!p.plan || typeof p.plan !== 'object') {
+        p.plan = defaultStudioPlan();
+      } else {
+        if (typeof p.plan.markdown !== 'string') p.plan.markdown = '';
+        if (!['none', 'draft', 'pending_approval', 'approved'].includes(p.plan.status)) {
+          p.plan.status = 'none';
+        }
+        if (typeof p.plan.updatedAt !== 'number') p.plan.updatedAt = 0;
+      }
+      if (typeof p.taskStatus !== 'string') p.taskStatus = 'idle';
+    }
     return raw;
   } catch {
-    return { chats: [] };
+    return { chats: [], studioProjects: [] };
   }
 }
 
@@ -140,6 +154,31 @@ function saveUserFile(userId, data) {
   const tmp = `${fp}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   fs.renameSync(tmp, fp);
+}
+
+/** Slug для URL и путей студии (латиница, дефисы). */
+function slugifyStudioName(name) {
+  const s = String(name || '')
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return s || 'project';
+}
+
+function studioUniqueSlug(base, projects, excludeId) {
+  let slug = base;
+  let n = 2;
+  while (projects.some((p) => p.slug === slug && p.id !== excludeId)) {
+    slug = `${base}-${n++}`;
+  }
+  return slug;
+}
+
+function defaultStudioPlan() {
+  return { markdown: '', status: 'none', updatedAt: 0 };
 }
 
 function roughPdfTextBuffer(buf) {
@@ -1009,6 +1048,227 @@ app.delete('/api/chats/:chatId', async (req, res) => {
     res.status(204).end();
   } catch (e) {
     logError(`API_CHATS_DELETE ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** ---------- Studio (/lovable): проекты, план, согласование ---------- */
+
+app.get('/api/studio/projects', (req, res) => {
+  try {
+    const data = loadUserFile(req.userId);
+    res.json({ projects: data.studioProjects });
+  } catch (e) {
+    logError(`STUDIO_PROJECTS_GET ${req.userId} ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.post('/api/studio/projects', async (req, res) => {
+  try {
+    const nameRaw = req.body && typeof req.body.name === 'string' ? req.body.name.trim() : '';
+    const name = nameRaw ? nameRaw.slice(0, 120) : 'Новый проект';
+    let slug =
+      req.body && typeof req.body.slug === 'string' ? req.body.slug.trim().toLowerCase() : '';
+    if (slug && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(slug)) {
+      res.status(400).json({ error: 'invalid_slug' });
+      return;
+    }
+    const project = {
+      id: crypto.randomUUID(),
+      name,
+      slug: '',
+      status: 'draft',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      plan: defaultStudioPlan(),
+      taskStatus: 'idle',
+    };
+    await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const base = slug || slugifyStudioName(name);
+      project.slug = studioUniqueSlug(base, data.studioProjects, null);
+      data.studioProjects.push(project);
+      saveUserFile(req.userId, data);
+    });
+    logAccess(`STUDIO_PROJECT_CREATE user=${req.userId} id=${project.id}`);
+    res.status(201).json({ project });
+  } catch (e) {
+    logError(`STUDIO_PROJECTS_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.get('/api/studio/projects/:projectId', (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const data = loadUserFile(req.userId);
+    const project = data.studioProjects.find((p) => p.id === projectId);
+    if (!project) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ project });
+  } catch (e) {
+    logError(`STUDIO_PROJECT_GET ${req.userId} ${e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.patch('/api/studio/projects/:projectId', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const out = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      if (typeof body.name === 'string') {
+        const n = body.name.trim().slice(0, 120);
+        if (n) project.name = n;
+      }
+      if (typeof body.slug === 'string') {
+        const s = body.slug.trim().toLowerCase();
+        if (s && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(s)) {
+          return { code: 400, err: 'invalid_slug' };
+        }
+        if (s) project.slug = studioUniqueSlug(s, data.studioProjects, projectId);
+      }
+      if (body.status === 'draft' || body.status === 'active' || body.status === 'archived') {
+        project.status = body.status;
+      }
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      return { project: JSON.parse(JSON.stringify(project)) };
+    });
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (out.code === 400) {
+      res.status(400).json({ error: out.err || 'bad_request' });
+      return;
+    }
+    res.json({ project: out.project });
+  } catch (e) {
+    logError(`STUDIO_PROJECT_PATCH ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+app.delete('/api/studio/projects/:projectId', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const deleted = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const before = data.studioProjects.length;
+      data.studioProjects = data.studioProjects.filter((p) => p.id !== projectId);
+      if (data.studioProjects.length === before) return false;
+      saveUserFile(req.userId, data);
+      return true;
+    });
+    if (!deleted) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    logAccess(`STUDIO_PROJECT_DELETE user=${req.userId} id=${projectId}`);
+    res.status(204).end();
+  } catch (e) {
+    logError(`STUDIO_PROJECT_DELETE ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** Черновик плана (агент или заглушка). status в теле: draft → правка без ожидания апрува; иначе → pending_approval */
+app.post('/api/studio/projects/:projectId/plan', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  const markdown =
+    req.body && typeof req.body.markdown === 'string' ? req.body.markdown.slice(0, 50_000) : '';
+  const want =
+    req.body && req.body.status === 'draft' ? 'draft' : 'pending_approval';
+  if (!markdown.trim()) {
+    res.status(400).json({ error: 'empty_plan' });
+    return;
+  }
+  try {
+    const out = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      project.plan = {
+        markdown,
+        status: want === 'draft' ? 'draft' : 'pending_approval',
+        updatedAt: Date.now(),
+      };
+      project.taskStatus = want === 'draft' ? 'planning' : 'awaiting_user_approval';
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      return { project: JSON.parse(JSON.stringify(project)) };
+    });
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    res.json({ project: out.project });
+  } catch (e) {
+    logError(`STUDIO_PLAN_POST ${e.stack || e.message}`);
+    res.status(500).json({ error: 'storage_error' });
+  }
+});
+
+/** Согласование плана пользователем — после этого разрешена реализация (оркестратор позже). */
+app.post('/api/studio/projects/:projectId/plan/approve', async (req, res) => {
+  const projectId = req.params.projectId;
+  if (!isUuidLike(projectId)) {
+    res.status(400).json({ error: 'bad_id' });
+    return;
+  }
+  try {
+    const out = await userTxn(req.userId, async () => {
+      const data = loadUserFile(req.userId);
+      const project = data.studioProjects.find((p) => p.id === projectId);
+      if (!project) return { code: 404 };
+      if (project.plan.status !== 'pending_approval') {
+        return { code: 409, planStatus: project.plan.status };
+      }
+      project.plan = {
+        ...project.plan,
+        status: 'approved',
+        updatedAt: Date.now(),
+      };
+      project.taskStatus = 'implementing';
+      project.updatedAt = Date.now();
+      saveUserFile(req.userId, data);
+      logAccess(`STUDIO_PLAN_APPROVE user=${req.userId} project=${projectId}`);
+      return { project: JSON.parse(JSON.stringify(project)) };
+    });
+    if (out.code === 404) {
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+    if (out.code === 409) {
+      res.status(409).json({ error: 'plan_not_awaiting_approval', planStatus: out.planStatus });
+      return;
+    }
+    res.json({ project: out.project });
+  } catch (e) {
+    logError(`STUDIO_PLAN_APPROVE ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
   }
 });

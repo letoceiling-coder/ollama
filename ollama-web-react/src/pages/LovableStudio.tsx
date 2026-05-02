@@ -1,21 +1,24 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import {
+  approveStudioPlan,
+  createStudioProject,
+  getStudioProject,
+  getStudioProjects,
+  postStudioPlan,
+} from '../api/studioClient';
+import type { StudioProject } from '../api/studioTypes';
+import { buildPlanOutlineFromUserPrompt } from '../studio/planOutline';
 
-/** Запланированные возможности автоматизации — бэкенд агента подключится позже. */
+/** Запланированные возможности — roadmap UI */
 const AGENT_TOOLCHAIN = [
   'scaffold · npm create vite@latest',
   'deps · npm ci / lockfile',
-  'preview · ephemeral dev URL',
+  'preview · static build + URL',
   'lint/test · CI hooks',
-  'container · Dockerfile + compose',
-  'smoke · Playwright / curl health',
+  'container · Docker',
 ] as const;
-
-interface AgentTask {
-  id: string;
-  title: string;
-  done: boolean;
-}
 
 interface ChatTurn {
   id: string;
@@ -29,52 +32,125 @@ const DEMO_PREVIEW_HTML = `<!DOCTYPE html><html lang="ru"><head><meta charset="U
 .dot{width:.65rem;height:.65rem;border-radius:999px;background:#34d399;display:inline-block;margin-right:.35rem;vertical-align:middle;animation:p 1.4s ease-in-out infinite}
 @keyframes p{0%,100%{opacity:.35}50%{opacity:1}}
 small{display:block;margin-top:.75rem;font-size:.72rem;color:#64748b;line-height:1.45}
-</style></head><body><div class="card"><p><span class="dot"></span>Демо-превью</p><small>Позже здесь будет iframe на поднятый агентом dev-сервер или статический билд из CI.</small></div></body></html>`;
+</style></head><body><div class="card"><p><span class="dot"></span>Превью после сборки</p><small>После согласования плана здесь появится iframe на собранный билд из runner (фаза 2).</small></div></body></html>`;
+
+const QK = {
+  projects: ['studio', 'projects'] as const,
+  project: (id: string) => ['studio', 'project', id] as const,
+};
+
+function statusLabel(s: StudioProject['taskStatus']): string {
+  const map: Record<string, string> = {
+    idle: 'Ожидание',
+    planning: 'Планирование',
+    awaiting_user_approval: 'Ждёт согласования',
+    implementing: 'Реализация',
+    building: 'Сборка',
+    ready_for_review: 'Проверка',
+    done: 'Готово',
+    failed: 'Ошибка',
+  };
+  return map[s] || s;
+}
 
 export function LovableStudio() {
+  const queryClient = useQueryClient();
   const [previewKey, setPreviewKey] = useState(0);
-  const [tasks, setTasks] = useState<AgentTask[]>([
-    { id: '1', title: 'Инициализировать репозиторий и Vite + React + TS', done: false },
-    { id: '2', title: 'Подключить Tailwind и базовые UI-компоненты', done: false },
-    { id: '3', title: 'Выдать URL превью (изолированная песочница)', done: false },
-  ]);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatTurn[]>([
     {
       id: 'w',
       role: 'agent',
       content:
-        'Опишите сайт или приложение одним сообщением — я разложу это на задачи, предложу стек и подготовлю превью. Позже этот канал будет связан с оркестратором агента на сервере.',
+        'Опишите сайт или приложение. Я составлю **план** и отправлю его на ваше согласование. После «Согласовать и запустить» будет запущена реализация и сборка (runner подключается на следующей фазе).',
     },
   ]);
   const [draft, setDraft] = useState('');
+  const [flowError, setFlowError] = useState<string | null>(null);
+
+  const projectsQuery = useQuery({
+    queryKey: QK.projects,
+    queryFn: getStudioProjects,
+  });
+
+  const createProjectMu = useMutation({
+    mutationFn: () => createStudioProject({ name: 'Мой проект · студия' }),
+    onSuccess: (proj) => {
+      setProjectId(proj.id);
+      void queryClient.invalidateQueries({ queryKey: QK.projects });
+    },
+  });
+
+  useEffect(() => {
+    if (!projectsQuery.isSuccess) return;
+    if (projectsQuery.data.length === 0 && !createProjectMu.isPending && !createProjectMu.isSuccess && !createProjectMu.isError) {
+      createProjectMu.mutate();
+    }
+    if (projectsQuery.data.length > 0 && !projectId) {
+      setProjectId(projectsQuery.data[0].id);
+    }
+  }, [projectsQuery.isSuccess, projectsQuery.data, projectId, createProjectMu]);
+
+  const projectQuery = useQuery({
+    queryKey: projectId ? QK.project(projectId) : ['studio', 'project', 'none'],
+    queryFn: () => getStudioProject(projectId!),
+    enabled: !!projectId,
+  });
+
+  const project = projectQuery.data;
+
+  const postPlanMu = useMutation({
+    mutationFn: ({ id, md }: { id: string; md: string }) => postStudioPlan(id, md, 'pending_approval'),
+    onSuccess: (_, { md }) => {
+      void queryClient.invalidateQueries({ queryKey: QK.projects });
+      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'agent',
+          content:
+            'План сохранён и отправлен на **согласование**. Проверьте блок слева и нажмите «Согласовать и запустить», когда готовы.\n\n---\n' +
+            md.slice(0, 1200) +
+            (md.length > 1200 ? '\n…' : ''),
+        },
+      ]);
+    },
+    onError: (e: Error) => setFlowError(e.message),
+  });
+
+  const approveMu = useMutation({
+    mutationFn: (id: string) => approveStudioPlan(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: QK.projects });
+      if (projectId) void queryClient.invalidateQueries({ queryKey: QK.project(projectId) });
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: 'agent',
+          content:
+            'План **согласован**. Дальше: реализация в workspace, `npm run build`, preview URL — по `lovable_plan.md` (фазы 2–3). Сейчас инфраструктура runner ещё не подключена; статус задачи: реализация.',
+        },
+      ]);
+    },
+    onError: (e: Error) => setFlowError(e.message),
+  });
 
   const previewSrcDoc = useMemo(() => DEMO_PREVIEW_HTML, []);
 
-  const toggleTask = useCallback((id: string) => {
-    setTasks((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)),
-    );
-  }, []);
-
   const sendDraft = useCallback(() => {
+    setFlowError(null);
     const text = draft.trim();
-    if (!text) return;
-    const uid = () =>
-      typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`;
-    setMessages((prev) => [
-      ...prev,
-      { id: uid(), role: 'user', content: text },
-      {
-        id: uid(),
-        role: 'agent',
-        content:
-          'Черновой интерфейс: сообщение записано локально. Следующий шаг — API проекта (`POST /api/studio/...`) и runner для превью, чтобы агент реально поднимал `vite dev` или статический билд.',
-      },
-    ]);
+    if (!text || !projectId) return;
+    const md = buildPlanOutlineFromUserPrompt(text);
+    const uid = () => crypto.randomUUID();
+    setMessages((prev) => [...prev, { id: uid(), role: 'user', content: text }]);
     setDraft('');
-  }, [draft]);
+    postPlanMu.mutate({ id: projectId, md });
+  }, [draft, projectId, postPlanMu]);
+
+  const busy = postPlanMu.isPending || approveMu.isPending || createProjectMu.isPending;
 
   return (
     <div className="flex h-full min-h-[100dvh] flex-col bg-[radial-gradient(ellipse_at_top,_rgba(16,163,127,0.14),transparent_55%),radial-gradient(ellipse_at_bottom,_rgba(120,80,220,0.1),transparent_52%)]">
@@ -91,67 +167,102 @@ export function LovableStudio() {
               Студия сайтов
             </h1>
             <p className="truncate text-[11px] text-zinc-500 md:text-xs">
-              Контекстное редактирование · превью · задачи для агента
+              План → согласование → сборка
             </p>
           </div>
-          <span className="hidden shrink-0 rounded-full border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-100 sm:inline">
-            MVP
-          </span>
+          {project ? (
+            <span className="hidden max-w-[10rem] truncate rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-100 sm:inline">
+              {statusLabel(project.taskStatus)}
+            </span>
+          ) : null}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            className="rounded-lg border border-white/10 bg-white/[0.06] px-3 py-1.5 text-xs text-zinc-300 transition hover:border-white/20 hover:text-white"
+            className="rounded-lg border border-white/10 bg-white/[0.06] px-3 py-1.5 text-xs text-zinc-300 transition hover:border-white/20 hover:text-white disabled:opacity-40"
             onClick={() => setPreviewKey((k) => k + 1)}
+            disabled={!project}
           >
             Обновить превью
           </button>
         </div>
       </header>
 
+      {flowError ? (
+        <div className="border-b border-red-500/30 bg-red-950/40 px-4 py-2 text-center text-xs text-red-200">
+          {flowError}
+          <button
+            type="button"
+            className="ml-2 underline"
+            onClick={() => setFlowError(null)}
+          >
+            закрыть
+          </button>
+        </div>
+      ) : null}
+
       <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-        <aside className="flex max-h-[38vh] shrink-0 flex-col border-b border-white/[0.06] bg-black/20 lg:h-auto lg:max-h-none lg:w-[280px] lg:border-b-0 lg:border-r">
+        <aside className="flex max-h-[42vh] shrink-0 flex-col border-b border-white/[0.06] bg-black/20 lg:h-auto lg:max-h-none lg:w-[300px] lg:border-b-0 lg:border-r">
           <div className="border-b border-white/[0.06] p-4">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Проект
+              Проект (API)
             </p>
-            <p className="mt-2 truncate text-sm font-medium text-zinc-100">
-              new-site · Vite React TS
-            </p>
-            <p className="mt-1 text-[11px] text-zinc-500">Ветка main · локальный черновик</p>
+            {projectsQuery.isLoading ? (
+              <p className="mt-2 text-sm text-zinc-400">Загрузка…</p>
+            ) : projectsQuery.isError ? (
+              <p className="mt-2 text-sm text-red-300">Не удалось загрузить проекты</p>
+            ) : project ? (
+              <>
+                <p className="mt-2 truncate text-sm font-medium text-zinc-100">{project.name}</p>
+                <p className="mt-1 font-mono text-[11px] text-zinc-500">
+                  {project.slug} · {project.id.slice(0, 8)}…
+                </p>
+              </>
+            ) : (
+              <p className="mt-2 text-sm text-zinc-400">Создаём проект…</p>
+            )}
           </div>
+
           <div className="scrollbar-thin flex-1 overflow-y-auto p-4">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+              План
+            </p>
+            {project && project.plan.markdown && project.plan.status !== 'none' ? (
+              <div className="mt-2 rounded-lg border border-white/10 bg-black/35 p-3 text-[12px] text-zinc-300">
+                <p className="mb-2 text-[10px] uppercase text-zinc-500">
+                  Статус плана: {project.plan.status}
+                </p>
+                <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap font-sans text-[11px] leading-relaxed">
+                  {project.plan.markdown}
+                </pre>
+                {project.plan.status === 'pending_approval' ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => projectId && approveMu.mutate(projectId)}
+                    className="mt-3 w-full rounded-lg border border-accent/40 bg-accent/25 py-2 text-sm font-medium text-white transition hover:bg-accent/35 disabled:opacity-40"
+                  >
+                    Согласовать и запустить
+                  </button>
+                ) : null}
+                {project.plan.status === 'approved' ? (
+                  <p className="mt-3 text-[11px] text-emerald-200/90">
+                    Согласовано. Ожидается реализация и сборка в runner.
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <p className="mt-2 text-[12px] text-zinc-500">
+                Отправьте описание в чат справа — появится черновой план и кнопка согласования.
+              </p>
+            )}
+
+            <p className="mt-6 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
               Файлы (заглушка)
             </p>
             <ul className="mt-3 space-y-1.5 font-mono text-[12px] text-zinc-400">
               <li className="rounded-md bg-white/[0.04] px-2 py-1">src/App.tsx</li>
-              <li className="rounded-md px-2 py-1">src/index.css</li>
-              <li className="rounded-md px-2 py-1">index.html</li>
-              <li className="rounded-md px-2 py-1">package.json</li>
-            </ul>
-
-            <p className="mt-6 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Задачи агента
-            </p>
-            <ul className="mt-3 space-y-2">
-              {tasks.map((t) => (
-                <li key={t.id}>
-                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-transparent px-2 py-1.5 transition hover:border-white/10 hover:bg-white/[0.04]">
-                    <input
-                      type="checkbox"
-                      checked={t.done}
-                      onChange={() => toggleTask(t.id)}
-                      className="mt-0.5 accent-emerald-500"
-                    />
-                    <span
-                      className={`text-[13px] leading-snug ${t.done ? 'text-zinc-500 line-through' : 'text-zinc-200'}`}
-                    >
-                      {t.title}
-                    </span>
-                  </label>
-                </li>
-              ))}
+              <li className="rounded-md px-2 py-1">… после фазы runner</li>
             </ul>
           </div>
         </aside>
@@ -160,7 +271,9 @@ export function LovableStudio() {
           <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-white/[0.06] bg-black/15 px-3 py-2 md:px-4">
             <span className="text-[11px] text-zinc-500">Превью</span>
             <code className="truncate rounded-md bg-black/40 px-2 py-1 font-mono text-[11px] text-emerald-200/90 ring-1 ring-white/10">
-              https://preview.<span className="text-zinc-500">…</span>/session‑xxxx
+            {project?.plan?.status === 'approved' || project?.taskStatus === 'implementing'
+                ? '(скоро) preview после build'
+                : '—'}
             </code>
           </div>
           <div className="relative min-h-[240px] flex-1 bg-zinc-950/80 p-3 md:p-4">
@@ -174,7 +287,7 @@ export function LovableStudio() {
           </div>
           <div className="shrink-0 border-t border-white/[0.06] bg-black/25 px-3 py-3 md:px-4">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Инструменты для агентов (дорожная карта)
+              Инструменты агента (roadmap)
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               {AGENT_TOOLCHAIN.map((t) => (
@@ -192,14 +305,16 @@ export function LovableStudio() {
         <aside className="flex max-h-[46vh] min-h-[200px] shrink-0 flex-col bg-black/25 lg:h-auto lg:max-h-none lg:w-[min(100%,380px)] lg:border-l lg:border-white/[0.06]">
           <div className="border-b border-white/[0.06] px-4 py-3">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
-              Контекст · запрос к агенту
+              Запрос · план
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
-              {['Лендинг SaaS', 'Портфолио', 'Dashboard админки'].map((s) => (
+              {['Лендинг SaaS', 'Портфолио', 'Dashboard'].map((s) => (
                 <button
                   key={s}
                   type="button"
-                  onClick={() => setDraft((d) => (d ? `${d}\n${s}` : `Сделай ${s.toLowerCase()} на React + Vite + Tailwind.`))}
+                  onClick={() =>
+                    setDraft((d) => (d ? `${d}\n${s}` : `Сделай ${s.toLowerCase()} на React + Vite + Tailwind.`))
+                  }
                   className="rounded-full border border-accent/25 bg-accent/10 px-2.5 py-1 text-[11px] text-emerald-100 transition hover:bg-accent/20"
                 >
                   + {s}
@@ -230,9 +345,10 @@ export function LovableStudio() {
             <textarea
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
-              placeholder="Опишите проект: цели, секции, стиль, интеграции…"
+              placeholder="Опишите проект: цели, секции, стиль…"
               rows={3}
-              className="w-full resize-none rounded-xl border border-white/10 bg-black/45 px-3 py-2.5 text-[13px] text-zinc-100 placeholder:text-zinc-600 ring-1 ring-black/30 focus:border-accent/40 focus:ring-accent/20"
+              disabled={!projectId || busy}
+              className="w-full resize-none rounded-xl border border-white/10 bg-black/45 px-3 py-2.5 text-[13px] text-zinc-100 placeholder:text-zinc-600 ring-1 ring-black/30 focus:border-accent/40 focus:ring-accent/20 disabled:opacity-45"
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
@@ -243,9 +359,10 @@ export function LovableStudio() {
             <button
               type="button"
               onClick={sendDraft}
-              className="mt-2 w-full rounded-xl border border-accent/35 bg-accent/20 py-2.5 text-sm font-medium text-white shadow-lg shadow-black/25 transition hover:bg-accent/30 active:scale-[0.99]"
+              disabled={!projectId || busy}
+              className="mt-2 w-full rounded-xl border border-accent/35 bg-accent/20 py-2.5 text-sm font-medium text-white shadow-lg shadow-black/25 transition hover:bg-accent/30 active:scale-[0.99] disabled:opacity-40"
             >
-              Отправить агенту
+              {postPlanMu.isPending ? 'Отправка плана…' : 'Составить план и отправить на согласование'}
             </button>
           </div>
         </aside>
