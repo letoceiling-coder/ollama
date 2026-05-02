@@ -29,6 +29,7 @@ const CHAT_SSE_ERROR_BANNER: Record<string, string> = {
   MODEL_NOT_INSTALLED: '⚠️ Модель не установлена',
   OLLAMA_NO_RESPONSE: '⚠️ Модель долго отвечает',
   OLLAMA_OFFLINE: '⚠️ Ollama недоступна',
+  LLM_UNAVAILABLE: '⚠️ Нет доступной модели: задайте ключи облака (Anthropic/OpenAI/Gemini) в .env на сервере',
   OLLAMA_TIMEOUT: '⚠️ Превышено время ожидания',
   OLLAMA_FAILED: '⚠️ Ошибка генерации',
   upstream_error: '⚠️ Ошибка ответа модели',
@@ -51,6 +52,7 @@ export function ChatLayout() {
   const [loading, setLoading] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [ollamaHealth, setOllamaHealth] = useState<'ok' | 'offline' | null>(null);
+  const [cloudFallbackConfigured, setCloudFallbackConfigured] = useState(false);
   const [staged, setStaged] = useState<StagedAttachment[]>([]);
   const stagedRef = useRef(staged);
   stagedRef.current = staged;
@@ -99,8 +101,11 @@ export function ChatLayout() {
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      const status = await fetchOllamaHealth();
-      if (!cancelled) setOllamaHealth(status);
+      const h = await fetchOllamaHealth();
+      if (!cancelled) {
+        setOllamaHealth(h.status);
+        setCloudFallbackConfigured(h.cloudFallbackConfigured);
+      }
     };
     void tick();
     const id = window.setInterval(tick, 5000);
@@ -400,9 +405,16 @@ export function ChatLayout() {
             <span>Ollama …</span>
           ) : ollamaHealth === 'ok' ? (
             <span title="Модели доступны через шлюз">🟢 online</span>
+          ) : cloudFallbackConfigured ? (
+            <span
+              title="Локальная Ollama недоступна; ответы идут через облачные модели (ключи в .env на сервере)."
+              className="cursor-help border-b border-dotted border-amber-500/80 text-amber-200/90"
+            >
+              🟡 cloud
+            </span>
           ) : (
             <span
-              title="Нет ответа от Ollama по OLLAMA_URL (на VPS чаще всего нужен SSH-туннель с ПК, где запущен ollama serve — см. docs/SERVER_AND_REPO.md). Сайт и чат работают, генерация — после восстановления туннеля."
+              title="Нет ответа от Ollama и не настроены облачные ключи — см. .env.example и docs/SERVER_AND_REPO.md."
               className="cursor-help border-b border-dotted border-zinc-500"
             >
               🔴 offline

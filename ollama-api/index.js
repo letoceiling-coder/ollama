@@ -1941,6 +1941,34 @@ function drainStreamQueue() {
 }
 
 /**
+ * SSE для POST /api/stream/generate: псевдо-поток в форме NDJSON как у Ollama (`{ "response": "..." }`).
+ */
+async function streamQueueEmitCloudOllamaShaped(res, req, promptText) {
+  const cloud = await studioLlmCompleteCloud(promptText, STUDIO_CLOUD_MAX_TOKENS, 'stream');
+  if (!cloud.ok) return { ok: false };
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.flushHeaders?.();
+  }
+  const step = 64;
+  for (let i = 0; i < cloud.text.length; i += step) {
+    if (req.aborted || res.writableEnded) break;
+    const piece = cloud.text.slice(i, i + step);
+    res.write(`data: ${JSON.stringify({ response: piece })}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  }
+  if (!res.writableEnded) {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  }
+  return { ok: true };
+}
+
+/**
  * Читает поток Ollama (NDJSON по строкам), отдаёт клиенту как SSE: data: …\n\n, в конце data: [DONE].
  */
 async function processStreamQueuedJob(job) {
@@ -1976,6 +2004,25 @@ async function processStreamQueuedJob(job) {
 
   stripImagesIfUnsupported(upstreamPayload, upstreamPayload.model);
 
+  let promptForCloud = prompt;
+  if (images && images.length > 0) {
+    promptForCloud = `${prompt}\n\n[Системное примечание: изображения переданы; Ollama недоступна — ответь по тексту запроса.]`;
+  }
+
+  if (ollamaHealthCached.status !== 'ok') {
+    if (studioLlmFallbackConfigured()) {
+      const cr = await streamQueueEmitCloudOllamaShaped(res, req, promptForCloud);
+      if (cr.ok) {
+        logAccess(`STREAM_QUEUE_CLOUD ip=${req.ip} user=${req.userId} model=${model}`);
+        return;
+      }
+    }
+    if (!res.headersSent) {
+      res.status(503).json({ error: 'OLLAMA_OFFLINE' });
+    }
+    return;
+  }
+
   let upstream;
   try {
     upstream = await fetchOllamaWithRetry(`${OLLAMA_URL}/api/generate`, {
@@ -1985,6 +2032,13 @@ async function processStreamQueuedJob(job) {
     });
   } catch (err) {
     logError(`STREAM_QUEUE_FETCH_ERR ip=${req.ip} ${err.stack || err.message}`);
+    if (studioLlmFallbackConfigured()) {
+      const cr = await streamQueueEmitCloudOllamaShaped(res, req, promptForCloud);
+      if (cr.ok) {
+        logAccess(`STREAM_QUEUE_CLOUD ip=${req.ip} user=${req.userId} model=${model}`);
+        return;
+      }
+    }
     if (!res.headersSent) {
       res.status(503).json({ error: 'OLLAMA_OFFLINE' });
     }
@@ -1997,30 +2051,37 @@ async function processStreamQueuedJob(job) {
 
   req.once('close', cleanupUpstream);
 
-    if (!upstream.ok || upstream.body == null) {
-      cleanupUpstream();
-      let text = '';
-      try {
-        text = await upstream.text();
-      } catch (e) {
-        logError(`STREAM_QUEUE_READ_ERR ${e.message}`);
-      }
-      logError(`STREAM_QUEUE_HTTP_ERR status=${upstream.status} body=${text.slice(0, 600)}`);
-      if (!res.headersSent) {
-        if (isOllamaOutOfMemoryMessage(text)) {
-          console.error('[MODEL] not enough memory');
-          res.status(503).json({ error: 'MODEL_OUT_OF_MEMORY' });
-          return;
-        }
-        const offline = upstream.status === 503 || upstream.status === 502;
-        if (offline) {
-          res.status(503).json({ error: 'OLLAMA_OFFLINE' });
-          return;
-        }
-        res.status(upstream.status).type('application/json').send(text || JSON.stringify({ error: 'Upstream error' }));
-      }
-      return;
+  if (!upstream.ok || upstream.body == null) {
+    cleanupUpstream();
+    let text = '';
+    try {
+      text = await upstream.text();
+    } catch (e) {
+      logError(`STREAM_QUEUE_READ_ERR ${e.message}`);
     }
+    logError(`STREAM_QUEUE_HTTP_ERR status=${upstream.status} body=${text.slice(0, 600)}`);
+    if (!res.headersSent) {
+      if (isOllamaOutOfMemoryMessage(text)) {
+        console.error('[MODEL] not enough memory');
+        res.status(503).json({ error: 'MODEL_OUT_OF_MEMORY' });
+        return;
+      }
+      if (studioLlmFallbackConfigured()) {
+        const cr = await streamQueueEmitCloudOllamaShaped(res, req, promptForCloud);
+        if (cr.ok) {
+          logAccess(`STREAM_QUEUE_CLOUD ip=${req.ip} user=${req.userId} model=${model}`);
+          return;
+        }
+      }
+      const offline = upstream.status === 503 || upstream.status === 502;
+      if (offline) {
+        res.status(503).json({ error: 'OLLAMA_OFFLINE' });
+        return;
+      }
+      res.status(upstream.status).type('application/json').send(text || JSON.stringify({ error: 'Upstream error' }));
+    }
+    return;
+  }
 
   try {
     res.writeHead(200, {
@@ -3769,7 +3830,7 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
       persistedUser += `\n\nДокументы:\n${docBlock}`;
     }
 
-    if (ollamaHealthCached.status !== 'ok') {
+    if (ollamaHealthCached.status !== 'ok' && !studioLlmFallbackConfigured()) {
       sseError(503, 'OLLAMA_OFFLINE');
       return;
     }
@@ -3900,6 +3961,75 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
       })}\n\n`,
     );
 
+    const cloudPromptForChat = () => {
+      let p = streamMeta.promptFull;
+      if (streamMeta.imagesForOllama?.length) {
+        p = `${p}\n\n[Системное примечание: пользователь прикрепил изображение(я); локальная Ollama недоступна — ответь по тексту запроса и истории; не утверждай точное содержимое пикселей изображения.]`;
+      }
+      return p;
+    };
+
+    const streamCloudDeltasToChat = async () => {
+      const cloud = await studioLlmCompleteCloud(cloudPromptForChat(), STUDIO_CLOUD_MAX_TOKENS, 'stream');
+      if (!cloud.ok) return { ok: false, err: cloud.err };
+      const step = 80;
+      for (let i = 0; i < cloud.text.length; i += step) {
+        if (req.aborted || res.writableEnded) break;
+        res.write(`data: ${JSON.stringify({ type: 'delta', delta: cloud.text.slice(i, i + step) })}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+      }
+      logAccess(`API_MESSAGE_CLOUD user=${req.userId} chat=${chatId} provider=${cloud.provider}`);
+      return { ok: true, text: cloud.text };
+    };
+
+    const finalizeChatAssistant = async (accumulated) => {
+      let chatSnapshot;
+      await userTxn(req.userId, async () => {
+        const data = loadUserFile(req.userId);
+        const chat = data.chats.find((c) => c.id === chatId);
+        if (!chat || !Array.isArray(chat.messages)) return;
+        const am = chat.messages.find((m) => m.id === streamMeta.asstMsgId);
+        if (am) am.content = accumulated;
+        chat.updatedAt = Date.now();
+        saveUserFile(req.userId, data);
+        chatSnapshot = JSON.parse(JSON.stringify(chat));
+      });
+      const assistantMessage =
+        chatSnapshot &&
+        chatSnapshot.messages &&
+        chatSnapshot.messages.find((m) => m.id === streamMeta.asstMsgId);
+      stopHeartbeat();
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'done',
+          chat: chatSnapshot,
+          assistantMessage: assistantMessage || null,
+        })}\n\n`,
+      );
+      res.write('data: [DONE]\n\n');
+      res.end();
+      cleanupStagedFileSet(req.userId, usedFileIds);
+      console.log('[CHAT] done');
+      logAccess(`API_MESSAGE_STREAM_OK user=${req.userId} chat=${chatId} vision=${hasVision ? 1 : 0}`);
+    };
+
+    if (ollamaHealthCached.status !== 'ok') {
+      const cr = await streamCloudDeltasToChat();
+      if (!cr.ok) {
+        try {
+          await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
+        } catch (_) {
+          /* ignore */
+        }
+        sseError(503, 'LLM_UNAVAILABLE');
+        releaseConcurrency();
+        return;
+      }
+      await finalizeChatAssistant(cr.text || '');
+      releaseConcurrency();
+      return;
+    }
+
     const upstreamPayload = {
       model: streamMeta.modelUsed,
       prompt: streamMeta.promptFull,
@@ -3935,13 +4065,13 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
     } catch (fetchErr) {
       console.error('[OLLAMA ERROR]', fetchErr);
       logError(`API_MESSAGE_STREAM_FETCH ${req.userId} ${fetchErr.stack || fetchErr.message}`);
-      try {
-        await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
-      } catch (_) {
-        /* ignore */
-      }
       if (isOllamaOutOfMemoryMessage(fetchErr.message)) {
         console.error('[MODEL] not enough memory');
+        try {
+          await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
+        } catch (_) {
+          /* ignore */
+        }
         sseError(503, 'MODEL_OUT_OF_MEMORY');
         releaseConcurrency();
         return;
@@ -3952,10 +4082,27 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
           fetchErr.code === 'ABORT_ERR' ||
           (fetchErr.cause && fetchErr.cause.name === 'AbortError'));
       if (aborted) {
+        try {
+          await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
+        } catch (_) {
+          /* ignore */
+        }
         sseError(504, 'OLLAMA_TIMEOUT');
-      } else {
-        sseError(503, 'OLLAMA_FAILED');
+        releaseConcurrency();
+        return;
       }
+      const cr = await streamCloudDeltasToChat();
+      if (cr.ok) {
+        await finalizeChatAssistant(cr.text || '');
+        releaseConcurrency();
+        return;
+      }
+      try {
+        await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
+      } catch (_) {
+        /* ignore */
+      }
+      sseError(503, 'OLLAMA_FAILED');
       releaseConcurrency();
       return;
     }
@@ -3979,14 +4126,22 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
         /* ignore */
       }
       logError(`API_MESSAGE_STREAM_HTTP status=${upstream.status} body=${text.slice(0, 600)}`);
-      await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
       if (isOllamaOutOfMemoryMessage(text)) {
         console.error('[MODEL] not enough memory');
+        await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
         sseError(503, 'MODEL_OUT_OF_MEMORY');
         cleanupUpstream();
         releaseConcurrency();
         return;
       }
+      const cr = await streamCloudDeltasToChat();
+      if (cr.ok) {
+        cleanupUpstream();
+        await finalizeChatAssistant(cr.text || '');
+        releaseConcurrency();
+        return;
+      }
+      await rollbackAssistantMessage(req.userId, chatId, streamMeta.asstMsgId);
       const offline = upstream.status === 503 || upstream.status === 502;
       sseError(offline ? 503 : upstream.status, offline ? 'OLLAMA_OFFLINE' : 'upstream_error');
       cleanupUpstream();
@@ -4078,39 +4233,7 @@ app.post('/api/chats/:chatId/message', async (req, res) => {
       return;
     }
 
-    /** @type {Record<string, unknown> | undefined} */
-    let chatSnapshot;
-    await userTxn(req.userId, async () => {
-      const data = loadUserFile(req.userId);
-      const chat = data.chats.find((c) => c.id === chatId);
-      if (!chat || !Array.isArray(chat.messages)) return;
-      const am = chat.messages.find((m) => m.id === streamMeta.asstMsgId);
-      if (am) am.content = accumulated;
-      chat.updatedAt = Date.now();
-      saveUserFile(req.userId, data);
-      chatSnapshot = JSON.parse(JSON.stringify(chat));
-    });
-
-    const assistantMessage =
-      chatSnapshot &&
-      chatSnapshot.messages &&
-      chatSnapshot.messages.find((m) => m.id === streamMeta.asstMsgId);
-
-    stopHeartbeat();
-    res.write(
-      `data: ${JSON.stringify({
-        type: 'done',
-        chat: chatSnapshot,
-        assistantMessage: assistantMessage || null,
-      })}\n\n`,
-    );
-    res.write('data: [DONE]\n\n');
-    res.end();
-
-    cleanupStagedFileSet(req.userId, usedFileIds);
-
-    console.log('[CHAT] done');
-    logAccess(`API_MESSAGE_STREAM_OK user=${req.userId} chat=${chatId} vision=${hasVision ? 1 : 0}`);
+    await finalizeChatAssistant(accumulated);
     releaseConcurrency();
   } catch (pipeErr) {
     try {
@@ -4158,7 +4281,7 @@ app.post('/api/stream/generate', (req, res) => {
     return res.status(400).json({ error: 'model is not allowed', allowed: ALLOWED_MODELS });
   }
 
-  if (ollamaHealthCached.status !== 'ok') {
+  if (ollamaHealthCached.status !== 'ok' && !studioLlmFallbackConfigured()) {
     return res.status(503).json({ error: 'OLLAMA_OFFLINE' });
   }
 
@@ -4177,7 +4300,10 @@ app.post('/api/stream/generate', (req, res) => {
 });
 
 app.get('/api/health/ollama', (_req, res) => {
-  res.json({ status: ollamaHealthCached.status });
+  res.json({
+    status: ollamaHealthCached.status,
+    cloudFallbackConfigured: studioLlmFallbackConfigured(),
+  });
 });
 
 app.get('/health', (req, res) => {
