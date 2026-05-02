@@ -664,6 +664,13 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
   return changed;
 }
 
+function studioWorkspaceHasNpmLockfile(wsRoot) {
+  return (
+    fs.existsSync(path.join(wsRoot, 'package-lock.json')) ||
+    fs.existsSync(path.join(wsRoot, 'npm-shrinkwrap.json'))
+  );
+}
+
 function studioSanitizeRelativePath(relRaw) {
   const s = String(relRaw || '').replace(/\\/g, '/');
   const parts = s.split('/').filter((p) => p.length > 0 && p !== '.');
@@ -961,8 +968,16 @@ async function executeStudioPreviewBuild(userId, projectId) {
     if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
 
     const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
-    const header = `${pkgSanitized ? '[studio] скорректирован lucide-react в package.json; package-lock.json пересоздаётся\n' : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
-    const npmInstallCmd = pkgSanitized
+    const lockPresent = studioWorkspaceHasNpmLockfile(ws);
+    const useNpmInstall = pkgSanitized || !lockPresent;
+    const headerExtra = [
+      pkgSanitized ? '[studio] скорректирован lucide-react в package.json; lock пересоздаётся' : null,
+      !lockPresent && !pkgSanitized ? '[studio] нет package-lock.json — выполняется npm install' : null,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    const header = `${headerExtra ? `${headerExtra}\n` : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
+    const npmInstallCmd = useNpmInstall
       ? ['install', '--no-audit', '--no-fund']
       : ['ci', '--no-audit', '--no-fund'];
     const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
@@ -971,7 +986,7 @@ async function executeStudioPreviewBuild(userId, projectId) {
       return;
     }
     const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
-    const r1Label = pkgSanitized ? '=== npm install ===' : '=== npm ci ===';
+    const r1Label = useNpmInstall ? '=== npm install ===' : '=== npm ci ===';
     const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2.log}`;
     await persistStudioBuildResult(userId, projectId, r2.code === 0, r2.code, combined, executor);
   } catch (e) {
