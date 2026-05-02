@@ -373,6 +373,11 @@ export function LovableStudio() {
                 {project.plan.status === 'approved' ? (
                   <div className="mt-3 space-y-2">
                     <p className="text-[11px] text-emerald-200/90">Согласовано. Запустите сборку превью.</p>
+                    {project.taskStatus === 'failed' ? (
+                      <p className="text-[10px] text-zinc-400">
+                        После ошибки нажмите кнопку ниже — это тот же запуск сборки, отдельного пункта меню не нужно.
+                      </p>
+                    ) : null}
                     {project.taskStatus === 'failed' && project.lastBuild?.log ? (
                       <details className="rounded border border-red-500/30 bg-red-950/30 p-2 text-[10px] text-red-100">
                         <summary className="cursor-pointer font-medium">Лог ошибки сборки</summary>
@@ -395,7 +400,9 @@ export function LovableStudio() {
                           ? 'Сборка…'
                           : project.taskStatus === 'ready_for_review'
                             ? 'Пересобрать превью'
-                            : 'Собрать превью'}
+                            : project.taskStatus === 'failed'
+                              ? 'Повторить сборку превью'
+                              : 'Собрать превью'}
                       </button>
                     ) : null}
                   </div>
