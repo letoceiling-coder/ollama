@@ -595,6 +595,8 @@ const STUDIO_NPM_PACKAGE_KEY_FIXES = {
   'tailwind-css': 'tailwindcss',
   tailwind_css: 'tailwindcss',
 };
+/** Если модель запросила несуществующий patch tailwind v3 (напр. ^3.12.1). */
+const STUDIO_TAILWIND_V3_FALLBACK = (process.env.STUDIO_TAILWIND_V3_FALLBACK || '^3.4.17').trim() || '^3.4.17';
 fs.mkdirSync(DATA_USERS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(STUDIO_WORKSPACES_ROOT, { recursive: true });
@@ -699,29 +701,121 @@ function studioDropBogusDependencies(pkg) {
   return changed;
 }
 
-/** Если в scripts есть vite, но пакета vite нет — подставляем из studio-template (иначе vite: not found). */
+/** Символы вне допустимого для диапазона версий npm + типичный мусор LLM (W^…], кавычки). */
+function studioScrubNpmVersionValue(ver) {
+  let s = String(ver || '').trim();
+  s = s.replace(/[[\]`'"]/g, '');
+  s = s.replace(/^[^\d^~<>=]+/u, '');
+  return s.trim();
+}
+
+function studioScrubAllDependencyVersionRanges(pkg) {
+  const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+  let changed = false;
+  for (const sec of sections) {
+    const o = pkg[sec];
+    if (!o || typeof o !== 'object') continue;
+    for (const k of Object.keys(o)) {
+      if (typeof o[k] !== 'string') continue;
+      const n = studioScrubNpmVersionValue(o[k]);
+      if (n !== o[k]) {
+        o[k] = n;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/** В линии tailwind v3 не было 3.11+; типичная галлюцинация ^3.12.1. */
+function studioNormalizeTailwindcssVersion(ver) {
+  const s = studioScrubNpmVersionValue(ver);
+  if (!s) return STUDIO_TAILWIND_V3_FALLBACK;
+  if (/^[\^~]?\s*4\./.test(s)) return s;
+  if (/3\.(1[1-9]|[2-9]\d)(\.\d+)?/i.test(s)) return STUDIO_TAILWIND_V3_FALLBACK;
+  return s;
+}
+
+function studioNormalizeLucideReactVersion(ver) {
+  let s = studioScrubNpmVersionValue(ver);
+  if (!s || !/[\d]/.test(s)) return STUDIO_NPM_LUCIDE_REACT;
+  if (studioLucideReactRangeLooksInvalid(s)) return STUDIO_NPM_LUCIDE_REACT;
+  return s;
+}
+
+function studioEnsurePackageScripts(pkg) {
+  const tpl = studioReadTemplatePackageJson();
+  if (!tpl || !tpl.scripts || typeof tpl.scripts !== 'object') return false;
+  if (!pkg.scripts || typeof pkg.scripts !== 'object') pkg.scripts = {};
+  let changed = false;
+  if (!String(pkg.scripts.build || '').trim()) {
+    pkg.scripts.build = typeof tpl.scripts.build === 'string' ? tpl.scripts.build : 'vite build';
+    changed = true;
+  }
+  if (!String(pkg.scripts.dev || '').trim() && typeof tpl.scripts.dev === 'string') {
+    pkg.scripts.dev = tpl.scripts.dev;
+    changed = true;
+  }
+  return changed;
+}
+
+/** Удаляет production=true / omit=dev из .npmrc в workspace (иначе npm отрезает devDeps — нет vite). */
+function studioSanitizeWorkspaceNpmrc(wsRoot) {
+  const fp = path.join(wsRoot, '.npmrc');
+  if (!fs.existsSync(fp)) return false;
+  let raw;
+  try {
+    raw = fs.readFileSync(fp, 'utf8');
+  } catch {
+    return false;
+  }
+  const lines = raw.split(/\r?\n/);
+  const kept = lines.filter((line) => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return true;
+    if (/^production\s*=\s*true\s*$/i.test(t)) return false;
+    if (/^omit\s*=\s*dev\s*$/i.test(t)) return false;
+    if (/^omit\[\]\s*=\s*dev\s*$/i.test(t)) return false;
+    return true;
+  });
+  const next = kept.join('\n');
+  if (next === raw) return false;
+  fs.writeFileSync(fp, `${next.endsWith('\n') ? next.slice(0, -1) : next}\n`, 'utf8');
+  logAccess(`STUDIO_NPMRC_SANITIZE ${wsRoot}`);
+  return true;
+}
+
+/** Пины vite + @vitejs/plugin-react + typescript из шаблона (снимает vite@3 + plugin@4). */
 function studioEnsureViteToolchain(pkg) {
   const tpl = studioReadTemplatePackageJson();
-  if (!tpl || !tpl.devDependencies || typeof tpl.devDependencies !== 'object') return false;
+  if (!tpl?.devDependencies || typeof tpl.devDependencies !== 'object') return false;
   const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
   const joined = `${String(scripts.build || '')} ${String(scripts.dev || '')} ${String(scripts.preview || '')}`;
-  if (!/\bvite\b/.test(joined)) return false;
-  const need = ['vite', '@vitejs/plugin-react', 'typescript'];
+  const usesViteScript = /\bvite\b/.test(joined);
+  const hasViteishDep = Boolean(
+    pkg.dependencies?.vite ||
+      pkg.devDependencies?.vite ||
+      pkg.dependencies?.['@vitejs/plugin-react'] ||
+      pkg.devDependencies?.['@vitejs/plugin-react'] ||
+      pkg.dependencies?.tailwindcss ||
+      pkg.devDependencies?.tailwindcss,
+  );
+  if (!usesViteScript && !hasViteishDep) return false;
+
+  if (!pkg.devDependencies || typeof pkg.devDependencies !== 'object') pkg.devDependencies = {};
   let changed = false;
+  const need = ['vite', '@vitejs/plugin-react', 'typescript'];
   for (const name of need) {
     const vtpl = tpl.devDependencies[name];
     if (typeof vtpl !== 'string') continue;
-    const anywhere =
-      pkg.dependencies?.[name] ||
-      pkg.devDependencies?.[name] ||
-      pkg.optionalDependencies?.[name];
-    if (typeof anywhere === 'string') continue;
-    if (!pkg.devDependencies || typeof pkg.devDependencies !== 'object') {
-      pkg.devDependencies = {};
+    if (pkg.devDependencies[name] !== vtpl) {
+      pkg.devDependencies[name] = vtpl;
       changed = true;
     }
-    pkg.devDependencies[name] = vtpl;
-    changed = true;
+    if (pkg.dependencies && typeof pkg.dependencies[name] === 'string') {
+      delete pkg.dependencies[name];
+      changed = true;
+    }
   }
   return changed;
 }
@@ -841,6 +935,8 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
   let changed = studioStripControlCharsFromPackageJsonStrings(pkg);
   changed = studioRenameMalformedNpmPackageKeys(pkg) || changed;
   changed = studioDropBogusDependencies(pkg) || changed;
+  changed = studioScrubAllDependencyVersionRanges(pkg) || changed;
+  changed = studioEnsurePackageScripts(pkg) || changed;
   changed = studioEnsureViteToolchain(pkg) || changed;
   const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
   for (const sec of sections) {
@@ -852,11 +948,20 @@ function studioSanitizeWorkspacePackageJson(wsRoot) {
       if (typeof o['lucide-react'] !== 'string') o['lucide-react'] = v;
       changed = true;
     }
-    if (typeof o['lucide-react'] !== 'string') continue;
-    const cur = o['lucide-react'];
-    if (studioLucideReactRangeLooksInvalid(cur)) {
-      o['lucide-react'] = STUDIO_NPM_LUCIDE_REACT;
-      changed = true;
+    if (typeof o['tailwindcss'] === 'string') {
+      const n = studioNormalizeTailwindcssVersion(o['tailwindcss']);
+      if (n !== o['tailwindcss']) {
+        o['tailwindcss'] = n;
+        changed = true;
+      }
+    }
+    if (typeof o['lucide-react'] === 'string') {
+      const n = studioNormalizeLucideReactVersion(o['lucide-react']);
+      const fin = studioLucideReactRangeLooksInvalid(n) ? STUDIO_NPM_LUCIDE_REACT : n;
+      if (fin !== o['lucide-react']) {
+        o['lucide-react'] = fin;
+        changed = true;
+      }
     }
   }
   if (changed) {
@@ -1207,13 +1312,19 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const planMd = project?.plan?.markdown || '';
   if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
 
+  const npmrcSanitized = studioSanitizeWorkspaceNpmrc(ws);
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
-    !STUDIO_PREVIEW_USE_NPM_CI || pkgRepaired || pkgSanitized || !lockPresent;
+    !STUDIO_PREVIEW_USE_NPM_CI ||
+    pkgRepaired ||
+    pkgSanitized ||
+    !lockPresent ||
+    npmrcSanitized;
   const headerExtra = [
     !STUDIO_PREVIEW_USE_NPM_CI ? '[studio] npm install (по умолчанию: lock подстраивается под package.json)' : null,
+    npmrcSanitized ? '[studio] очищен .npmrc (production/omit=dev)' : null,
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
@@ -1223,8 +1334,8 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     .join('\n');
   const header = `${headerExtra ? `${headerExtra}\n` : ''}[studio executor=${executor} image=${executor === 'docker' ? STUDIO_DOCKER_IMAGE : 'n/a'}]\n`;
   const npmInstallCmd = useNpmInstall
-    ? ['install', '--no-audit', '--no-fund']
-    : ['ci', '--no-audit', '--no-fund'];
+    ? ['install', '--no-audit', '--no-fund', '--include=dev', '--legacy-peer-deps']
+    : ['ci', '--no-audit', '--no-fund', '--include=dev', '--legacy-peer-deps'];
   const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
   const r1Label = useNpmInstall ? '=== npm install ===' : '=== npm ci ===';
   if (r1.code !== 0) {
