@@ -541,6 +541,16 @@ export function LovableStudio() {
             <code className="truncate rounded-md bg-black/40 px-2 py-1 font-mono text-[11px] text-emerald-200/90 ring-1 ring-white/10">
               {iframeRealSrc || '—'}
             </code>
+            {iframeRealSrc ? (
+              <a
+                href={iframeRealSrc}
+                target="_blank"
+                rel="noreferrer"
+                className="ml-auto rounded-md border border-emerald-400/25 bg-emerald-400/10 px-3 py-1 text-[11px] font-medium text-emerald-100 transition hover:bg-emerald-400/20"
+              >
+                Открыть в новом окне
+              </a>
+            ) : null}
           </div>
           <div className="relative min-h-[240px] flex-1 bg-zinc-950/80 p-3 md:p-4">
             <iframe
