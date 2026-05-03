@@ -1019,6 +1019,7 @@ function studioEnsureProductFrontend(wsRoot, projectName, planMarkdown, reason) 
   const hero = studioFirstQuotedText(plan);
   const appStillGeneric =
     studioHasTemplateApp(wsRoot) ||
+    (studioPlanIsStretchCeilings(planMarkdown) && studioAppMissesStretchCeilingScope(app)) ||
     !/href="#lead"|id="lead"|Получить|заявк|консультац/i.test(app) ||
     (hero && !app.includes(hero));
   if (!appStillGeneric) return false;
