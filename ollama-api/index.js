@@ -943,6 +943,82 @@ function studioValidateVitePreviewDist(wsRoot) {
   return { ok: true };
 }
 
+/** Галлюцинации LLM: React.createRoot(render(<App />)),root) и т.п. */
+function mainTsxEntryLooksBroken(src) {
+  const s = String(src || '');
+  if (!s.trim()) return true;
+  if (/React\.createRoot\s*\(\s*render\s*\(/i.test(s)) return true;
+  if (/createRoot\s*\(\s*render\s*\(/i.test(s)) return true;
+  if (/\)\s*,\s*root\s*\)/.test(s)) return true;
+  if (/createRoot\s*\(\s*<[^>]+>\s*\)/.test(s)) return true;
+  return false;
+}
+
+/** Перед vite build: подмена src/main.tsx|jsx эталоном при мусорном mount API. */
+function studioEnsureWorkspaceMainEntry(wsRoot) {
+  if (!studioWorkspaceUsesVite(wsRoot)) return false;
+  const tplPath = path.join(STUDIO_TEMPLATE_DIR, 'src', 'main.tsx');
+  if (!fs.existsSync(tplPath)) return false;
+  const tpl = fs.readFileSync(tplPath, 'utf8');
+  let changed = false;
+  for (const rel of ['src/main.tsx', 'src/main.jsx']) {
+    const fp = path.join(wsRoot, rel);
+    if (!fs.existsSync(fp)) continue;
+    let raw;
+    try {
+      raw = fs.readFileSync(fp, 'utf8');
+    } catch {
+      continue;
+    }
+    if (!mainTsxEntryLooksBroken(raw)) continue;
+    const out = path.join(wsRoot, 'src/main.tsx');
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, tpl, 'utf8');
+    if (rel.endsWith('.jsx') && fp !== out) {
+      try {
+        fs.unlinkSync(fp);
+      } catch {
+        /* */
+      }
+    }
+    logAccess(`STUDIO_MAIN_ENTRY_RESET ${rel} ${wsRoot}`);
+    changed = true;
+    break;
+  }
+  return changed;
+}
+
+/**
+ * Если сборка упала по логу — сначала правки без LLM (обход json_parse у recovery-модели).
+ */
+function studioDeterministicRepairAfterFailedBuild(wsRoot, buildLogText) {
+  const log = String(buildLogText || '');
+  const notes = [];
+  let changed = false;
+  const mainFail =
+    /\bsrc\/main\.(tsx|jsx)\b/i.test(log) &&
+    /(Expected|Transform failed|SyntaxError|ERROR|error during build)/i.test(log);
+  if (mainFail) {
+    const tplPath = path.join(STUDIO_TEMPLATE_DIR, 'src', 'main.tsx');
+    if (fs.existsSync(tplPath)) {
+      const dst = path.join(wsRoot, 'src/main.tsx');
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.writeFileSync(dst, fs.readFileSync(tplPath, 'utf8'), 'utf8');
+      logAccess(`STUDIO_MAIN_RECOVERY_TEMPLATE ${wsRoot}`);
+      changed = true;
+      notes.push('src/main.tsx из шаблона');
+    }
+  }
+  if (/vite:build-html|build-html/i.test(log) && /index\.html/i.test(log)) {
+    if (studioEnsureWorkspaceIndexHtml(wsRoot)) {
+      changed = true;
+      notes.push('index.html');
+    }
+  }
+  if (!changed) return { changed: false, message: '' };
+  return { changed: true, message: `Без LLM: ${notes.join(', ')}.` };
+}
+
 /** Пины vite + @vitejs/plugin-react + typescript из шаблона (снимает vite@3 + plugin@4). */
 function studioEnsureViteToolchain(pkg) {
   const tpl = studioReadTemplatePackageJson();
@@ -1558,12 +1634,14 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
   const viteBaseOk = studioEnsureViteRelativeBase(ws);
   const indexHtmlReset = studioEnsureWorkspaceIndexHtml(ws);
+  const mainEntryReset = studioEnsureWorkspaceMainEntry(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
     !STUDIO_PREVIEW_USE_NPM_CI ||
     pkgRepaired ||
     pkgSanitized ||
     indexHtmlReset ||
+    mainEntryReset ||
     !lockPresent ||
     npmrcSanitized;
   const headerExtra = [
@@ -1573,6 +1651,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
+    mainEntryReset ? '[studio] src/main.tsx исправлен (createRoot/render и типичный мусор)' : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
@@ -3780,6 +3859,12 @@ async function studioApplyWorkspacePatchTxn(userId, projectId, baseRevisionId, o
 }
 
 async function studioTryRecoverWorkspaceFromBuildLog(userId, projectId, buildLogText) {
+  const ws = ensureStudioWorkspaceScaffold(userId, projectId);
+  const det = studioDeterministicRepairAfterFailedBuild(ws, buildLogText);
+  if (det.changed) {
+    return { applied: true, note: `${det.message} Повторная сборка…` };
+  }
+
   let headRev = null;
   let projectPlan = '';
   await userTxn(userId, async () => {
@@ -3792,7 +3877,6 @@ async function studioTryRecoverWorkspaceFromBuildLog(userId, projectId, buildLog
     projectPlan = project.plan && typeof project.plan.markdown === 'string' ? project.plan.markdown : '';
   });
 
-  const ws = ensureStudioWorkspaceScaffold(userId, projectId);
   const files = studioListWorkspaceFiles(ws);
   const fileSummary = files.slice(0, 80).map((f) => f.path).join('\n') || '(пусто)';
 
