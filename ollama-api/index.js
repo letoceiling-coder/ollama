@@ -737,7 +737,8 @@ function studioBuildGeneratedLandingApp(projectName, planMarkdown) {
         ['Быстрая сборка', 'Vite + React + Tailwind дают лёгкий production-бандл для preview и деплоя.'],
       ];
   const featureLiteral = JSON.stringify(features);
-  return `import { ArrowRight, BarChart3, Bot, BrainCircuit, Check, Database, MessageCircle, Play, ShieldCheck, Sparkles, Users, Workflow, Zap } from 'lucide-react';
+  return `import React from 'react';
+import { ArrowRight, BarChart3, Bot, BrainCircuit, Check, Database, MessageCircle, Play, ShieldCheck, Sparkles, Users, Workflow, Zap } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 const features = ${featureLiteral} as const;
@@ -1142,6 +1143,46 @@ function studioPatchViteConfigContent(raw) {
   return next;
 }
 
+function studioEnsureViteReactPlugin(wsRoot) {
+  if (!studioWorkspaceUsesVite(wsRoot)) return false;
+  const names = ['vite.config.ts', 'vite.config.mts', 'vite.config.js', 'vite.config.mjs'];
+  let existing = null;
+  for (const name of names) {
+    const fp = path.join(wsRoot, name);
+    if (fs.existsSync(fp)) {
+      existing = fp;
+      break;
+    }
+  }
+  let raw = '';
+  if (existing) {
+    try {
+      raw = fs.readFileSync(existing, 'utf8');
+    } catch {
+      raw = '';
+    }
+  }
+  if (/@vitejs\/plugin-react|react\s*\(\s*\)/.test(raw)) return false;
+  const target = existing || path.join(wsRoot, 'vite.config.ts');
+  const content = `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  base: './',
+  plugins: [react()],
+});
+`;
+  try {
+    fs.writeFileSync(target, content, 'utf8');
+  } catch {
+    const rel = path.relative(wsRoot, target).replace(/\\/g, '/');
+    studioDockerRootRm(wsRoot, rel);
+    fs.writeFileSync(target, content, 'utf8');
+  }
+  logAccess(`STUDIO_VITE_REACT_PLUGIN ${path.basename(target)} ${wsRoot}`);
+  return true;
+}
+
 /** Перед сборкой: base: './' в vite.config.* или копия шаблона, если конфига нет. */
 function studioEnsureViteRelativeBase(wsRoot) {
   if (!studioWorkspaceUsesVite(wsRoot)) return false;
@@ -1357,6 +1398,53 @@ function studioEnsureWorkspaceMainEntry(wsRoot) {
     logAccess(`STUDIO_MAIN_ENTRY_RESET ${rel} ${wsRoot}`);
     changed = true;
     break;
+  }
+  return changed;
+}
+
+function studioLooksLikeTsxWithJsx(raw) {
+  return /<[A-Z][A-Za-z0-9]*(\s|>|\/)/.test(String(raw || '')) || /<React\./.test(String(raw || ''));
+}
+
+function studioEnsureReactImportForTsx(wsRoot) {
+  const srcDir = path.join(wsRoot, 'src');
+  if (!fs.existsSync(srcDir)) return false;
+  let changed = false;
+  const stack = [srcDir];
+  while (stack.length) {
+    const dir = stack.pop();
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of ents) {
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        stack.push(fp);
+        continue;
+      }
+      if (!e.isFile() || !/\.(tsx|jsx)$/.test(e.name)) continue;
+      let raw;
+      try {
+        raw = fs.readFileSync(fp, 'utf8');
+      } catch {
+        continue;
+      }
+      if (!studioLooksLikeTsxWithJsx(raw)) continue;
+      if (/import\s+React\b|import\s+\*\s+as\s+React\s+from\s+['"]react['"]/.test(raw)) continue;
+      const next = `import React from 'react';\n${raw}`;
+      try {
+        fs.writeFileSync(fp, next, 'utf8');
+      } catch {
+        const rel = path.relative(wsRoot, fp).replace(/\\/g, '/');
+        studioDockerRootRm(wsRoot, rel);
+        fs.writeFileSync(fp, next, 'utf8');
+      }
+      changed = true;
+      logAccess(`STUDIO_REACT_IMPORT_ADDED ${path.relative(wsRoot, fp).replace(/\\/g, '/')}`);
+    }
   }
   return changed;
 }
@@ -2091,9 +2179,11 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const npmrcSanitized = studioSanitizeWorkspaceNpmrc(ws);
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
   const pkgSanitized = studioSanitizeWorkspacePackageJson(ws);
+  const viteReactPluginFixed = studioEnsureViteReactPlugin(ws);
   const viteBaseOk = studioEnsureViteRelativeBase(ws);
   const indexHtmlReset = studioEnsureWorkspaceIndexHtml(ws);
   const mainEntryReset = studioEnsureWorkspaceMainEntry(ws);
+  const reactImportFixed = studioEnsureReactImportForTsx(ws);
   const reactDomDepsFixed = studioEnsureReactDomClientDeps(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
@@ -2102,8 +2192,10 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     productGenerated ||
     landingPackageFixed ||
     pkgSanitized ||
+    viteReactPluginFixed ||
     indexHtmlReset ||
     mainEntryReset ||
+    reactImportFixed ||
     reactDomDepsFixed ||
     !lockPresent ||
     npmrcSanitized;
@@ -2114,9 +2206,11 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     productGenerated ? '[studio] сгенерирован frontend из согласованного плана (не шаблон)' : null,
     landingPackageFixed ? '[studio] зафиксирован frontend toolchain для лендинга' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
+    viteReactPluginFixed ? '[studio] vite.config исправлен: подключён @vitejs/plugin-react' : null,
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
     mainEntryReset ? '[studio] src/main.tsx исправлен (createRoot/render и типичный мусор)' : null,
+    reactImportFixed ? '[studio] добавлен import React в TSX/JSX (защита от React is not defined)' : null,
     reactDomDepsFixed ? '[studio] добавлены react/react-dom для импорта react-dom/client' : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
