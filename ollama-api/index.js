@@ -711,15 +711,33 @@ function studioPlanLooksLikeLanding(plan) {
 
 function studioBuildGeneratedLandingApp(projectName, planMarkdown) {
   const plan = String(planMarkdown || '');
+  const isCeiling = studioPlanIsStretchCeilings(plan);
   const quoted = studioFirstQuotedText(plan);
-  const heroTitle = quoted || (/\bAI|ассист/i.test(plan) ? 'Внедряем AI в бизнес под ключ' : projectName || 'Современный цифровой продукт под ключ');
+  const heroTitle =
+    quoted ||
+    (isCeiling
+      ? 'Натяжные потолки под ключ за 1 день'
+      : /\bAI|ассист/i.test(plan)
+        ? 'Внедряем AI в бизнес под ключ'
+        : projectName || 'Современный цифровой продукт под ключ');
   const subtitle =
-    /Автоматизируйте продажи/i.test(plan)
+    isCeiling
+      ? 'Бесплатный замер, гарантия до 10 лет, аккуратный монтаж без пыли и понятная смета до начала работ.'
+      : /Автоматизируйте продажи/i.test(plan)
       ? 'Автоматизируйте продажи, поддержку и процессы с помощью интеллектуальных ассистентов'
       : /\bAI|ассист/i.test(plan)
         ? 'Запускаем AI-ассистентов, которые обрабатывают обращения, квалифицируют лиды и помогают команде расти быстрее.'
         : 'Создаём понятный интерфейс, который показывает ценность продукта, ведёт пользователя к действию и готов к подключению API.';
-  const features = /\bAI|ассист/i.test(plan)
+  const features = isCeiling
+    ? [
+        ['Монтаж за 1 день', 'Работаем быстро и чисто: без затяжного ремонта, пыли и грязи в квартире.'],
+        ['Бесплатный замер', 'Мастер приедет с образцами, рассчитает стоимость и зафиксирует смету.'],
+        ['Гарантия до 10 лет', 'Договор, чеки, собственные монтажники и понятная ответственность.'],
+        ['Каталог потолков', 'Матовые, глянцевые, тканевые, световые линии, двухуровневые и с подсветкой.'],
+        ['Калькулятор цены', 'Площадь, тип полотна, углы и светильники сразу влияют на предварительный расчёт.'],
+        ['Заявки в WhatsApp', 'Кнопки звонка, мессенджера и форма для расчёта за 5 минут.'],
+      ]
+    : /\bAI|ассист/i.test(plan)
     ? [
         ['AI чат для сайта', 'Консультирует посетителей, квалифицирует лиды и передаёт заявку менеджеру с полным контекстом.'],
         ['Telegram / CRM', 'Интеграции с мессенджерами, CRM и внутренними процессами компании.'],
@@ -737,21 +755,60 @@ function studioBuildGeneratedLandingApp(projectName, planMarkdown) {
         ['Быстрая сборка', 'Vite + React + Tailwind дают лёгкий production-бандл для preview и деплоя.'],
       ];
   const featureLiteral = JSON.stringify(features);
+  const cases = isCeiling
+    ? [
+        ['1 день', 'монтаж квартиры', 'Потолки в двух комнатах без переноса мебели и долгого ремонта.'],
+        ['−20%', 'акция сегодня', 'Скидка на световые линии и точечные светильники при заявке с сайта.'],
+        ['10 лет', 'гарантия', 'Фиксируем условия в договоре и отвечаем за качество монтажа.'],
+      ]
+    : [
+        ['x2', 'рост конверсии', 'Пользователь быстрее понимает ценность продукта и доходит до целевого действия.'],
+        ['−40%', 'меньше ручной работы', 'Типовые сценарии автоматизированы, а команда фокусируется на важных обращениях.'],
+        ['24/7', 'приём заявок', 'Сайт продолжает продавать и собирать лиды после рабочего дня.'],
+      ];
+  const tariffs = isCeiling
+    ? [
+        ['Эконом', 'от 690 ₽/м²', ['Матовый потолок', 'Белый профиль', 'Монтаж за 1 день', 'Гарантия 3 года']],
+        ['Стандарт', 'от 990 ₽/м²', ['Матовый или глянцевый', 'Точечные светильники', 'Договор и чеки', 'Гарантия 7 лет']],
+        ['Премиум', 'от 1 690 ₽/м²', ['Световые линии', 'Парящий профиль', 'Дизайн-схема', 'Гарантия 10 лет']],
+      ]
+    : [
+        ['Старт', 'от 79 000 ₽', ['Структура лендинга', 'Адаптивный UI', 'Форма заявки', 'Базовая аналитика']],
+        ['Бизнес', 'от 149 000 ₽', ['CRM / Telegram', 'AI-сценарии', 'Дашборд', 'A/B улучшения']],
+        ['Enterprise', 'по запросу', ['Индивидуальная архитектура', 'SLA', 'Интеграции', 'Безопасность']],
+      ];
+  const casesLiteral = JSON.stringify(cases);
+  const tariffsLiteral = JSON.stringify(tariffs);
+  const brand = isCeiling ? 'Потолки за 1 день' : projectName || 'AI внедрение';
+  const badge = isCeiling ? 'Скидка до 20% при заявке сегодня' : 'Премиальный SaaS-интерфейс, готовый к лидам';
+  const primaryCta = isCeiling ? 'Рассчитать стоимость' : 'Получить консультацию';
+  const secondaryCta = isCeiling ? 'Вызвать замерщика' : 'Посмотреть демо';
+  const demoKicker = isCeiling ? 'Калькулятор и портфолио' : 'Демо продукта';
+  const demoTitle = isCeiling
+    ? 'Расчёт стоимости, каталог потолков и примеры работ'
+    : 'Чат, панель управления и показатели в одном блоке';
+  const demoText = isCeiling
+    ? 'Покажите клиенту цену, варианты потолков, сроки монтажа и быстрый путь к заявке.'
+    : 'Визуал показывает живой продукт: обращения, лиды, контроль качества и понятные статусы.';
+  const leadTitle = isCeiling ? 'Получите бесплатный расчёт за 5 минут' : 'Получите бесплатный разбор проекта';
+  const leadText = isCeiling
+    ? 'Оставьте имя, телефон и площадь помещения — менеджер рассчитает стоимость и предложит удобное время замера.'
+    : 'Оставьте контакты — команда сможет подключить API, CRM или реальные формы на следующем этапе.';
+  const mockTitle = isCeiling ? 'Калькулятор замера' : 'Контроль заявок и диалогов';
+  const mockRole = isCeiling ? 'Заявка на потолок' : 'Ассистент';
+  const mockLine1 = isCeiling ? 'Площадь 18 м², матовое полотно, 6 светильников.' : 'Здравствуйте! Подберу сценарий внедрения под ваш бизнес.';
+  const mockLine2 = isCeiling ? 'Предварительно: от 19 900 ₽, монтаж завтра.' : 'Нужно больше заявок и меньше ручной обработки.';
+  const mockLine3 = isCeiling ? 'Менеджер подтвердит точную цену после бесплатного замера.' : 'Готово. Передаю заявку: высокий приоритет, бюджет подтверждён.';
+  const metric1 = isCeiling ? 'замер бесплатно' : '42 диалога сегодня';
+  const metric2 = isCeiling ? 'монтаж 24 часа' : '18 горячих лидов';
+  const metric3 = isCeiling ? 'гарантия 10 лет' : '91% качество ответов';
   return `import React from 'react';
 import { ArrowRight, BarChart3, Bot, BrainCircuit, Check, Database, MessageCircle, Play, ShieldCheck, Sparkles, Users, Workflow, Zap } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 const features = ${featureLiteral} as const;
-const cases = [
-  ['x2', 'рост конверсии', 'Пользователь быстрее понимает ценность продукта и доходит до целевого действия.'],
-  ['−40%', 'меньше ручной работы', 'Типовые сценарии автоматизированы, а команда фокусируется на важных обращениях.'],
-  ['24/7', 'приём заявок', 'Сайт продолжает продавать и собирать лиды после рабочего дня.'],
-] as const;
-const tariffs = [
-  ['Старт', 'от 79 000 ₽', ['Структура лендинга', 'Адаптивный UI', 'Форма заявки', 'Базовая аналитика']],
-  ['Бизнес', 'от 149 000 ₽', ['CRM / Telegram', 'AI-сценарии', 'Дашборд', 'A/B улучшения']],
-  ['Enterprise', 'по запросу', ['Индивидуальная архитектура', 'SLA', 'Интеграции', 'Безопасность']],
-] as const;
+const cases = ${casesLiteral} as const;
+const tariffs = ${tariffsLiteral} as const;
 const fade = { initial: { opacity: 0, y: 24 }, whileInView: { opacity: 1, y: 0 }, viewport: { once: true, margin: '-80px' }, transition: { duration: 0.65 } };
 
 function SectionTitle({ kicker, title, text }: { kicker: string; title: string; text: string }) {
@@ -759,20 +816,20 @@ function SectionTitle({ kicker, title, text }: { kicker: string; title: string; 
 }
 
 function ProductMock() {
-  return <motion.div initial={{ opacity: 0, scale: 0.96, y: 28 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.8 }} className="relative mx-auto max-w-xl"><div className="absolute -inset-8 rounded-[2rem] bg-gradient-to-r from-cyan-500/30 via-indigo-500/25 to-fuchsia-500/30 blur-3xl" /><div className="glass relative overflow-hidden rounded-3xl p-4 shadow-glow"><div className="mb-4 flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><div><p className="text-xs text-slate-400">Live product dashboard</p><p className="font-semibold text-white">Контроль заявок и диалогов</p></div><span className="rounded-full bg-emerald-400/15 px-3 py-1 text-xs text-emerald-200">Online</span></div><div className="grid gap-3 md:grid-cols-[1.15fr_.85fr]"><div className="rounded-2xl bg-slate-950/70 p-4"><div className="mb-4 flex gap-3"><Bot className="h-9 w-9 rounded-xl bg-cyan-400/15 p-2 text-cyan-200" /><div><p className="text-sm font-medium">Ассистент</p><p className="text-xs text-slate-400">Квалифицирует клиента</p></div></div><div className="space-y-3 text-sm"><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">Здравствуйте! Подберу сценарий внедрения под ваш бизнес.</p><p className="ml-8 rounded-2xl rounded-tr-sm bg-cyan-400/15 p-3 text-cyan-50">Нужно больше заявок и меньше ручной обработки.</p><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">Готово. Передаю заявку: высокий приоритет, бюджет подтверждён.</p></div></div><div className="space-y-3">{['42 диалога сегодня', '18 горячих лидов', '91% качество ответов'].map((item, i) => <div key={item} className="rounded-2xl bg-white/[0.07] p-4"><p className="text-xs text-slate-400">Метрика 0{i + 1}</p><p className="mt-1 font-semibold text-white">{item}</p></div>)}</div></div></div></motion.div>;
+  return <motion.div initial={{ opacity: 0, scale: 0.96, y: 28 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.8 }} className="relative mx-auto max-w-xl"><div className="absolute -inset-8 rounded-[2rem] bg-gradient-to-r from-cyan-500/30 via-indigo-500/25 to-fuchsia-500/30 blur-3xl" /><div className="glass relative overflow-hidden rounded-3xl p-4 shadow-glow"><div className="mb-4 flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><div><p className="text-xs text-slate-400">Live product preview</p><p className="font-semibold text-white">${studioTsxText(mockTitle)}</p></div><span className="rounded-full bg-emerald-400/15 px-3 py-1 text-xs text-emerald-200">Online</span></div><div className="grid gap-3 md:grid-cols-[1.15fr_.85fr]"><div className="rounded-2xl bg-slate-950/70 p-4"><div className="mb-4 flex gap-3"><Bot className="h-9 w-9 rounded-xl bg-cyan-400/15 p-2 text-cyan-200" /><div><p className="text-sm font-medium">${studioTsxText(mockRole)}</p><p className="text-xs text-slate-400">Ведёт клиента к заявке</p></div></div><div className="space-y-3 text-sm"><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">${studioTsxText(mockLine1)}</p><p className="ml-8 rounded-2xl rounded-tr-sm bg-cyan-400/15 p-3 text-cyan-50">${studioTsxText(mockLine2)}</p><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">${studioTsxText(mockLine3)}</p></div></div><div className="space-y-3">{[${studioJsonString(metric1)}, ${studioJsonString(metric2)}, ${studioJsonString(metric3)}].map((item, i) => <div key={item} className="rounded-2xl bg-white/[0.07] p-4"><p className="text-xs text-slate-400">Метрика 0{i + 1}</p><p className="mt-1 font-semibold text-white">{item}</p></div>)}</div></div></div></motion.div>;
 }
 
 export default function App() {
   return <main className="min-h-screen overflow-hidden bg-[#050816] text-slate-100"><div className="pointer-events-none fixed inset-0 noise opacity-30" /><div className="pointer-events-none fixed left-1/2 top-0 h-[520px] w-[760px] -translate-x-1/2 rounded-full bg-indigo-600/20 blur-3xl" />
-    <header className="sticky top-0 z-40 border-b border-white/10 bg-[#050816]/75 backdrop-blur-xl"><div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4"><a href="#top" className="flex items-center gap-3 font-semibold"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-cyan-400 to-violet-500"><BrainCircuit className="h-5 w-5" /></span>${studioTsxText(projectName || 'AI внедрение')}</a><nav className="hidden items-center gap-7 text-sm text-slate-300 md:flex"><a href="#features">Возможности</a><a href="#demo">Демо</a><a href="#cases">Кейсы</a><a href="#pricing">Тарифы</a></nav><a href="#lead" className="rounded-full bg-white px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-cyan-100">Консультация</a></div></header>
-    <section id="top" className="relative mx-auto grid max-w-7xl items-center gap-12 px-5 pb-20 pt-16 md:grid-cols-2 md:pb-28 md:pt-24"><motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.75 }}><div className="mb-6 inline-flex items-center gap-2 rounded-full border border-cyan-300/25 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-100"><Sparkles className="h-4 w-4" /> Премиальный SaaS-интерфейс, готовый к лидам</div><h1 className="max-w-3xl text-5xl font-semibold tracking-[-0.05em] text-white md:text-7xl">${studioTsxText(heroTitle)}</h1><p className="mt-6 max-w-xl text-lg leading-8 text-slate-300">${studioTsxText(subtitle)}</p><div className="mt-8 flex flex-col gap-3 sm:flex-row"><a href="#lead" className="group rounded-full bg-gradient-to-r from-cyan-300 to-violet-400 px-7 py-4 text-center font-semibold text-slate-950 shadow-glow">Получить консультацию <ArrowRight className="ml-2 inline h-4 w-4 transition group-hover:translate-x-1" /></a><a href="#demo" className="rounded-full border border-white/15 bg-white/8 px-7 py-4 text-center font-semibold text-white hover:bg-white/12"><Play className="mr-2 inline h-4 w-4" />Посмотреть демо</a></div><div className="mt-9 grid max-w-xl grid-cols-3 gap-3 text-center"><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">−40%</b><p className="text-xs text-slate-400">затраты</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">x2</b><p className="text-xs text-slate-400">конверсия</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">24/7</b><p className="text-xs text-slate-400">лиды</p></div></div></motion.div><ProductMock /></section>
+    <header className="sticky top-0 z-40 border-b border-white/10 bg-[#050816]/75 backdrop-blur-xl"><div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4"><a href="#top" className="flex items-center gap-3 font-semibold"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-cyan-400 to-violet-500"><BrainCircuit className="h-5 w-5" /></span>${studioTsxText(brand)}</a><nav className="hidden items-center gap-7 text-sm text-slate-300 md:flex"><a href="#features">Возможности</a><a href="#demo">Демо</a><a href="#cases">Кейсы</a><a href="#pricing">Тарифы</a></nav><a href="#lead" className="rounded-full bg-white px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-cyan-100">${isCeiling ? '+7 (495) 123-45-67' : 'Консультация'}</a></div></header>
+    <section id="top" className="relative mx-auto grid max-w-7xl items-center gap-12 px-5 pb-20 pt-16 md:grid-cols-2 md:pb-28 md:pt-24"><motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.75 }}><div className="mb-6 inline-flex items-center gap-2 rounded-full border border-cyan-300/25 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-100"><Sparkles className="h-4 w-4" /> ${studioTsxText(badge)}</div><h1 className="max-w-3xl text-5xl font-semibold tracking-[-0.05em] text-white md:text-7xl">${studioTsxText(heroTitle)}</h1><p className="mt-6 max-w-xl text-lg leading-8 text-slate-300">${studioTsxText(subtitle)}</p><div className="mt-8 flex flex-col gap-3 sm:flex-row"><a href="#lead" className="group rounded-full bg-gradient-to-r from-cyan-300 to-violet-400 px-7 py-4 text-center font-semibold text-slate-950 shadow-glow">${studioTsxText(primaryCta)} <ArrowRight className="ml-2 inline h-4 w-4 transition group-hover:translate-x-1" /></a><a href="#demo" className="rounded-full border border-white/15 bg-white/8 px-7 py-4 text-center font-semibold text-white hover:bg-white/12"><Play className="mr-2 inline h-4 w-4" />${studioTsxText(secondaryCta)}</a></div><div className="mt-9 grid max-w-xl grid-cols-3 gap-3 text-center"><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">${isCeiling ? '1 день' : '−40%'}</b><p className="text-xs text-slate-400">${isCeiling ? 'монтаж' : 'затраты'}</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">${isCeiling ? '0 ₽' : 'x2'}</b><p className="text-xs text-slate-400">${isCeiling ? 'замер' : 'конверсия'}</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">${isCeiling ? '10 лет' : '24/7'}</b><p className="text-xs text-slate-400">${isCeiling ? 'гарантия' : 'лиды'}</p></div></div></motion.div><ProductMock /></section>
     <section className="mx-auto max-w-7xl px-5 py-10"><motion.div {...fade} className="glass rounded-3xl p-6 md:p-8"><p className="mb-5 text-sm uppercase tracking-[0.25em] text-slate-400">Социальное доказательство</p><div className="grid gap-3 text-sm text-slate-300 md:grid-cols-5">{['Retail', 'EdTech', 'Real Estate', 'MedTech', 'B2B SaaS'].map((item) => <div key={item} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-4 text-center font-medium">{item}</div>)}</div></motion.div></section>
     <section id="features" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Возможности" title="Интерфейс, который показывает продукт и продаёт следующий шаг" text="Структура собрана под конверсию: ценность, доверие, демонстрация продукта, результаты, тарифы и форма заявки." /><div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">{features.map(([title, text], i) => { const icons = [MessageCircle, Workflow, Users, BarChart3, Database, ShieldCheck]; const Icon = icons[i] || Check; return <motion.article key={title} {...fade} className="glass group rounded-3xl p-6 transition hover:-translate-y-1 hover:border-cyan-300/35"><Icon className="mb-5 h-10 w-10 rounded-2xl bg-cyan-300/12 p-2 text-cyan-200" /><h3 className="text-xl font-semibold text-white">{title}</h3><p className="mt-3 leading-7 text-slate-300">{text}</p></motion.article>; })}</div></section>
     <section className="mx-auto max-w-7xl px-5 py-20"><SectionTitle kicker="Как это работает" title="От идеи до запуска за 3 этапа" text="Сервис формирует структуру, собирает интерфейс и готовит production preview без ручной сборки в редакторе." /><div className="grid gap-5 md:grid-cols-3">{['Анализ цели и аудитории', 'Генерация интерфейса и контента', 'Сборка, проверка и готовое превью'].map((item, index) => <motion.div key={item} {...fade} className="glass rounded-3xl p-7"><span className="text-5xl font-semibold text-white/15">0{index + 1}</span><h3 className="mt-5 text-xl font-semibold text-white">{item}</h3><p className="mt-3 text-slate-300">Каждый этап связан с запросом пользователя и критериями приёмки из согласованного плана.</p></motion.div>)}</div></section>
-    <section id="demo" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Демо продукта" title="Чат, панель управления и показатели в одном блоке" text="Визуал показывает живой продукт: обращения, лиды, контроль качества и понятные статусы." /><ProductMock /></section>
+    <section id="demo" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="${studioTsxText(demoKicker)}" title="${studioTsxText(demoTitle)}" text="${studioTsxText(demoText)}" /><ProductMock />${isCeiling ? '<div className="mt-10 grid gap-4 md:grid-cols-3"><div className="glass rounded-3xl p-6 text-center font-semibold text-white">Матовые от 690 ₽/м²</div><div className="glass rounded-3xl p-6 text-center font-semibold text-white">Световые линии от 1 450 ₽/м²</div><div className="glass rounded-3xl p-6 text-center font-semibold text-white">Двухуровневые от 1 690 ₽/м²</div></div>' : ''}</section>
     <section id="cases" className="mx-auto max-w-7xl px-5 py-20"><div className="grid gap-5 md:grid-cols-3">{cases.map(([num, title, text]) => <motion.div key={title} {...fade} className="glass rounded-3xl p-7"><p className="text-5xl font-semibold text-cyan-200">{num}</p><h3 className="mt-4 text-xl font-semibold text-white">{title}</h3><p className="mt-3 text-slate-300">{text}</p></motion.div>)}</div></section>
     <section id="pricing" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Тарифы" title="Стартуйте с нужного уровня внедрения" text="Пакеты можно заменить реальными ценами и подключить API оплаты или CRM позже." /><div className="grid gap-5 lg:grid-cols-3">{tariffs.map(([name, price, items], index) => <motion.div key={name} {...fade} className={\`rounded-3xl p-7 \${index === 1 ? 'bg-gradient-to-b from-cyan-300/20 to-violet-500/15 ring-1 ring-cyan-200/35 shadow-glow' : 'glass'}\`}><h3 className="text-2xl font-semibold text-white">{name}</h3><p className="mt-2 text-3xl font-semibold text-cyan-100">{price}</p><ul className="mt-6 space-y-3">{items.map((item) => <li key={item} className="flex gap-3 text-slate-300"><Check className="mt-1 h-4 w-4 text-emerald-300" />{item}</li>)}</ul><a href="#lead" className="mt-7 block rounded-full bg-white px-5 py-3 text-center font-semibold text-slate-950 hover:bg-cyan-100">Обсудить запуск</a></motion.div>)}</div></section>
-    <section id="lead" className="mx-auto max-w-7xl px-5 pb-28 pt-10"><div className="glass grid gap-8 rounded-[2rem] p-7 md:grid-cols-[1fr_.9fr] md:p-10"><div><p className="text-sm uppercase tracking-[0.25em] text-cyan-300">Заявка</p><h2 className="mt-3 text-3xl font-semibold text-white md:text-5xl">Получите бесплатный разбор проекта</h2><p className="mt-5 max-w-xl text-slate-300">Оставьте контакты — команда сможет подключить API, CRM или реальные формы на следующем этапе.</p></div><form className="space-y-4 rounded-3xl bg-slate-950/55 p-5"><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Ваше имя" /><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Телефон" /><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Telegram" /><button type="button" className="w-full rounded-2xl bg-gradient-to-r from-cyan-300 to-violet-400 px-5 py-4 font-semibold text-slate-950">Получить разбор</button><p className="text-xs text-slate-500">Форма готова для подключения API позже.</p></form></div></section>
+    <section id="lead" className="mx-auto max-w-7xl px-5 pb-28 pt-10"><div className="glass grid gap-8 rounded-[2rem] p-7 md:grid-cols-[1fr_.9fr] md:p-10"><div><p className="text-sm uppercase tracking-[0.25em] text-cyan-300">Заявка</p><h2 className="mt-3 text-3xl font-semibold text-white md:text-5xl">${studioTsxText(leadTitle)}</h2><p className="mt-5 max-w-xl text-slate-300">${studioTsxText(leadText)}</p></div><form className="space-y-4 rounded-3xl bg-slate-950/55 p-5"><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Ваше имя" /><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Телефон" />${isCeiling ? `<input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Площадь, м²" />` : `<input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Telegram" />`}<button type="button" className="w-full rounded-2xl bg-gradient-to-r from-cyan-300 to-violet-400 px-5 py-4 font-semibold text-slate-950">${isCeiling ? 'Получить точный расчёт' : 'Получить разбор'}</button><p className="text-xs text-slate-500">${isCeiling ? 'Перезвоним, уточним помещение и запишем на бесплатный замер.' : 'Форма готова для подключения API позже.'}</p></form></div></section>
     <footer className="border-t border-white/10 px-5 py-8"><div className="mx-auto flex max-w-7xl flex-col justify-between gap-4 text-sm text-slate-400 md:flex-row"><p>© 2026 ${studioTsxText(projectName || 'AI продукт')}</p><p>Telegram · WhatsApp · hello@example.com</p></div></footer>
     <a href="#lead" className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-full border border-cyan-200/30 bg-slate-950/85 px-5 py-4 text-sm font-semibold text-white shadow-glow backdrop-blur-xl hover:bg-slate-900"><Zap className="h-5 w-5 text-cyan-200" />Оставить заявку</a>
   </main>;
