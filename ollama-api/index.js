@@ -564,7 +564,8 @@ const STUDIO_MAX_BUILDS_GLOBAL = Math.max(1, Number(process.env.STUDIO_MAX_BUILD
 const STUDIO_MAX_BUILDS_PER_USER = Math.max(1, Number(process.env.STUDIO_MAX_BUILDS_PER_USER || 2));
 const STUDIO_FILE_MAX_READ = Math.min(Number(process.env.STUDIO_FILE_MAX_READ || 1_500_000), 5_000_000);
 const STUDIO_FILE_MAX_WRITE = Math.min(Number(process.env.STUDIO_FILE_MAX_WRITE || 1_500_000), 5_000_000);
-const STUDIO_WORKSPACE_IGNORE = new Set(['node_modules', 'dist', '.git', '.vite', '.DS_Store']);
+const STUDIO_PREVIEW_DIST_DIR = 'dist-studio';
+const STUDIO_WORKSPACE_IGNORE = new Set(['node_modules', 'dist', STUDIO_PREVIEW_DIST_DIR, '.git', '.vite', '.DS_Store']);
 const STUDIO_REVISIONS_ROOT = path.join(__dirname, 'data', 'studio-revisions');
 const STUDIO_REVISIONS_MAX_PER_PROJECT = Math.max(5, Number(process.env.STUDIO_REVISIONS_MAX_PER_PROJECT || 80));
 const STUDIO_WORKSPACE_PATCH_MAX_OPS = Math.max(1, Number(process.env.STUDIO_WORKSPACE_PATCH_MAX_OPS || 50));
@@ -918,10 +919,24 @@ function studioEnsureWorkspaceIndexHtml(wsRoot) {
 }
 
 /** После vite build: реальный бандл или снова сырой tsx в index. */
+function studioPreviewDistRoot(wsRoot) {
+  return path.join(wsRoot, STUDIO_PREVIEW_DIST_DIR);
+}
+
+function studioLegacyPreviewDistRoot(wsRoot) {
+  return path.join(wsRoot, 'dist');
+}
+
+function studioExistingPreviewDistRoot(wsRoot) {
+  const primary = studioPreviewDistRoot(wsRoot);
+  if (fs.existsSync(path.join(primary, 'index.html'))) return primary;
+  return studioLegacyPreviewDistRoot(wsRoot);
+}
+
 function studioValidateVitePreviewDist(wsRoot) {
-  const dist = path.join(wsRoot, 'dist');
+  const dist = studioPreviewDistRoot(wsRoot);
   const idx = path.join(dist, 'index.html');
-  if (!fs.existsSync(idx)) return { ok: false, reason: 'нет dist/index.html' };
+  if (!fs.existsSync(idx)) return { ok: false, reason: `нет ${STUDIO_PREVIEW_DIST_DIR}/index.html` };
   let html;
   try {
     html = fs.readFileSync(idx, 'utf8');
@@ -929,17 +944,17 @@ function studioValidateVitePreviewDist(wsRoot) {
     return { ok: false, reason: String(e.message || e) };
   }
   if (/text\/typescript/i.test(html)) {
-    return { ok: false, reason: 'dist/index.html: text/typescript (entry не обработан Vite)' };
+    return { ok: false, reason: `${STUDIO_PREVIEW_DIST_DIR}/index.html: text/typescript (entry не обработан Vite)` };
   }
   if (/src=["']\.?\/?src\/[^"']+\.(tsx|jsx)(\?[^"']*)?["']/i.test(html)) {
-    return { ok: false, reason: 'dist/index.html всё ещё указывает на .tsx/.jsx — не production-сборка' };
+    return { ok: false, reason: `${STUDIO_PREVIEW_DIST_DIR}/index.html всё ещё указывает на .tsx/.jsx — не production-сборка` };
   }
   const assetsDir = path.join(dist, 'assets');
   if (!fs.existsSync(assetsDir) || !fs.statSync(assetsDir).isDirectory()) {
-    return { ok: false, reason: 'нет dist/assets (пустая или неверная сборка)' };
+    return { ok: false, reason: `нет ${STUDIO_PREVIEW_DIST_DIR}/assets (пустая или неверная сборка)` };
   }
   const chunks = fs.readdirSync(assetsDir).filter((f) => /\.(js|mjs)$/i.test(f));
-  if (!chunks.length) return { ok: false, reason: 'dist/assets не содержит .js' };
+  if (!chunks.length) return { ok: false, reason: `${STUDIO_PREVIEW_DIST_DIR}/assets не содержит .js` };
   return { ok: true };
 }
 
@@ -1746,12 +1761,12 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   if (r1.code !== 0) {
     return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
   }
-  const r2 = await runNpm(ws, ['run', 'build'], STUDIO_BUILD_TIMEOUT_MS);
+  const r2 = await runNpm(ws, ['run', 'build', '--', '--outDir', STUDIO_PREVIEW_DIST_DIR, '--emptyOutDir'], STUDIO_BUILD_TIMEOUT_MS);
   let buildOk = r2.code === 0;
   let r2Log = r2.log;
   if (buildOk) {
     try {
-      studioRewriteBuiltPreviewAbsolutes(path.join(ws, 'dist'));
+      studioRewriteBuiltPreviewAbsolutes(studioPreviewDistRoot(ws));
     } catch (e) {
       logError(`STUDIO_DIST_REWRITE ${e.message}`);
     }
@@ -4671,7 +4686,7 @@ app.use('/preview', (req, res, next) => {
       .send('Ссылка недействительна или срок действия истёк.');
     return;
   }
-  const root = path.join(STUDIO_WORKSPACES_ROOT, decoded.userId, decoded.projectId, 'dist');
+  const root = studioExistingPreviewDistRoot(path.join(STUDIO_WORKSPACES_ROOT, decoded.userId, decoded.projectId));
   if (!fs.existsSync(path.join(root, 'index.html'))) {
     res.status(404).type('text/plain; charset=utf-8').send('Превью не собрано.');
     return;
@@ -4703,7 +4718,7 @@ app.use(
         res.status(404).json({ error: 'not_found' });
         return;
       }
-      const root = path.join(STUDIO_WORKSPACES_ROOT, req.userId, projectId, 'dist');
+      const root = studioExistingPreviewDistRoot(path.join(STUDIO_WORKSPACES_ROOT, req.userId, projectId));
       if (!fs.existsSync(path.join(root, 'index.html'))) {
         res
           .status(404)
