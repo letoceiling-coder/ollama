@@ -703,6 +703,27 @@ function studioHasTemplateApp(wsRoot) {
   return false;
 }
 
+function studioPlanIsStretchCeilings(plan) {
+  return /натяжн\w*\s+потол|потолк\w*\s+под\s+ключ|замерщик|световые линии|матовые|глянцевые/i.test(
+    String(plan || ''),
+  );
+}
+
+function studioAppMissesStretchCeilingScope(app) {
+  const s = String(app || '');
+  const required = [
+    /Натяжные потолки/i,
+    /калькулятор|рассчитать стоимость/i,
+    /матовые|глянцевые|световые линии/i,
+    /портфолио|работ/i,
+    /замер/i,
+    /Эконом|Стандарт|Премиум/i,
+    /отзыв/i,
+    /WhatsApp|телефон/i,
+  ];
+  return required.filter((re) => re.test(s)).length < 5;
+}
+
 function studioPlanLooksLikeLanding(plan) {
   return /\b(лендинг|landing|hero|cta|тариф|форма|заявк|консультац|saas|сайт|продаж)/i.test(
     String(plan || ''),
