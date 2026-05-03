@@ -891,6 +891,63 @@ createRoot(document.getElementById('root')!).render(
   return true;
 }
 
+function studioEnsureLandingPackageBaseline(wsRoot, reason) {
+  const fp = path.join(wsRoot, 'package.json');
+  let pkg = {};
+  try {
+    if (fs.existsSync(fp)) pkg = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    pkg = {};
+  }
+  if (!pkg || typeof pkg !== 'object') pkg = {};
+  const next = {
+    name: typeof pkg.name === 'string' && /^[a-z0-9._-]+$/i.test(pkg.name) ? pkg.name : 'studio-generated-product',
+    version: typeof pkg.version === 'string' ? pkg.version : '1.0.0',
+    private: true,
+    type: 'module',
+    scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' },
+    dependencies: {
+      '@vitejs/plugin-react': '^4.3.4',
+      vite: '^6.0.1',
+      typescript: '~5.6.2',
+      react: '^18.3.1',
+      'react-dom': '^18.3.1',
+      'framer-motion': '^11.0.0',
+      'lucide-react': '^0.469.0',
+    },
+    devDependencies: {
+      tailwindcss: STUDIO_TAILWIND_V3_FALLBACK,
+      postcss: '^8.4.49',
+      autoprefixer: '^10.4.20',
+    },
+  };
+  const body = `${JSON.stringify(next, null, 2)}\n`;
+  let old = '';
+  try {
+    old = fs.existsSync(fp) ? fs.readFileSync(fp, 'utf8') : '';
+  } catch {
+    old = '';
+  }
+  if (old === body) return false;
+  try {
+    fs.writeFileSync(fp, body, 'utf8');
+  } catch {
+    try {
+      fs.rmSync(fp, { force: true });
+    } catch {
+      studioDockerRootRm(wsRoot, 'package.json');
+    }
+    fs.writeFileSync(fp, body, 'utf8');
+  }
+  try {
+    fs.rmSync(path.join(wsRoot, 'package-lock.json'), { force: true });
+  } catch {
+    /* */
+  }
+  logAccess(`STUDIO_LANDING_PACKAGE_BASELINE reason=${reason || 'guard'} ws=${wsRoot}`);
+  return true;
+}
+
 function studioEnsureProductFrontend(wsRoot, projectName, planMarkdown, reason) {
   if (!studioHasTemplateApp(wsRoot) && !studioPlanLooksLikeLanding(planMarkdown)) return false;
   const appPath = path.join(wsRoot, 'src', 'App.tsx');
@@ -982,6 +1039,7 @@ function studioScrubAllDependencyVersionRanges(pkg) {
 function studioNormalizeTailwindcssVersion(ver) {
   const s = studioScrubNpmVersionValue(ver);
   if (!s) return STUDIO_TAILWIND_V3_FALLBACK;
+  if (/^[\^~]?\s*[5-9]\d*\./.test(s)) return STUDIO_TAILWIND_V3_FALLBACK;
   if (/^[\^~]?\s*4\./.test(s)) return s;
   if (/3\.(1[1-9]|[2-9]\d)(\.\d+)?/i.test(s)) return STUDIO_TAILWIND_V3_FALLBACK;
   return s;
@@ -2011,6 +2069,9 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     planMd,
     'pre_build_guard',
   );
+  const landingPackageFixed = studioPlanLooksLikeLanding(planMd)
+    ? studioEnsureLandingPackageBaseline(ws, 'pre_build_guard')
+    : false;
 
   const npmrcSanitized = studioSanitizeWorkspaceNpmrc(ws);
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
@@ -2024,6 +2085,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     !STUDIO_PREVIEW_USE_NPM_CI ||
     pkgRepaired ||
     productGenerated ||
+    landingPackageFixed ||
     pkgSanitized ||
     indexHtmlReset ||
     mainEntryReset ||
@@ -2035,6 +2097,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     npmrcSanitized ? '[studio] очищен .npmrc (production/omit=dev)' : null,
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
     productGenerated ? '[studio] сгенерирован frontend из согласованного плана (не шаблон)' : null,
+    landingPackageFixed ? '[studio] зафиксирован frontend toolchain для лендинга' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
@@ -3226,10 +3289,14 @@ async function executeStudioAgentRun(runId) {
     taskPlanMd || projPlanMd,
     'agent_run_guard',
   );
+  const packageBaseline = studioPlanLooksLikeLanding(taskPlanMd || projPlanMd)
+    ? studioEnsureLandingPackageBaseline(ws, 'agent_run_guard')
+    : false;
 
   emitStudioAgentEvent(runId, 'revision', {
     applied: patchOut.applied,
     generated_fallback: generatedFallback,
+    package_baseline: packageBaseline,
     revision_id: null,
   });
 
@@ -4902,10 +4969,18 @@ app.post('/api/studio/projects/:projectId/agent/apply-approved-plan', async (req
       peek.projPlanMd,
       'post_apply_guard',
     );
+    const packageBaseline = studioPlanLooksLikeLanding(peek.projPlanMd)
+      ? studioEnsureLandingPackageBaseline(ws, 'post_apply_guard')
+      : false;
     logAccess(
-      `STUDIO_APPLY_APPROVED_PLAN user=${req.userId} project=${projectId} applied=${patchOut.applied} generatedFallback=${generatedFallback ? 1 : 0}`,
+      `STUDIO_APPLY_APPROVED_PLAN user=${req.userId} project=${projectId} applied=${patchOut.applied} generatedFallback=${generatedFallback ? 1 : 0} packageBaseline=${packageBaseline ? 1 : 0}`,
     );
-    res.status(200).json({ applied: patchOut.applied, generated_fallback: generatedFallback, revision_id: null });
+    res.status(200).json({
+      applied: patchOut.applied,
+      generated_fallback: generatedFallback,
+      package_baseline: packageBaseline,
+      revision_id: null,
+    });
   } catch (e) {
     logError(`STUDIO_APPLY_APPROVED_PLAN ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
