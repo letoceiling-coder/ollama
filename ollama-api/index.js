@@ -1009,6 +1009,12 @@ function studioDeterministicRepairAfterFailedBuild(wsRoot, buildLogText) {
       notes.push('src/main.tsx из шаблона');
     }
   }
+  if (/react-dom\/client/i.test(log) && /failed to resolve import|could not resolve|cannot find/i.test(log)) {
+    if (studioEnsureReactDomClientDeps(wsRoot)) {
+      changed = true;
+      notes.push('react/react-dom в package.json');
+    }
+  }
   if (/vite:build-html|build-html/i.test(log) && /index\.html/i.test(log)) {
     if (studioEnsureWorkspaceIndexHtml(wsRoot)) {
       changed = true;
@@ -1092,6 +1098,77 @@ function studioEnsureReactRuntimeDeps(pkg) {
     }
   }
   return changed;
+}
+
+function studioWorkspaceSourceMentions(wsRoot, needleRe) {
+  const srcDir = path.join(wsRoot, 'src');
+  if (!fs.existsSync(srcDir)) return false;
+  const stack = [srcDir];
+  while (stack.length) {
+    const dir = stack.pop();
+    let ents;
+    try {
+      ents = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of ents) {
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        stack.push(fp);
+        continue;
+      }
+      if (!e.isFile() || !/\.(tsx|ts|jsx|js)$/.test(e.name)) continue;
+      let raw;
+      try {
+        raw = fs.readFileSync(fp, 'utf8');
+      } catch {
+        continue;
+      }
+      if (needleRe.test(raw)) return true;
+    }
+  }
+  return false;
+}
+
+/** Если код импортирует react-dom/client, package.json обязан содержать react и react-dom до npm install. */
+function studioEnsureReactDomClientDeps(wsRoot) {
+  if (!studioWorkspaceSourceMentions(wsRoot, /from\s+['"]react-dom\/client['"]|require\(\s*['"]react-dom\/client['"]\s*\)/)) {
+    return false;
+  }
+  const tpl = studioReadTemplatePackageJson();
+  const fp = path.join(wsRoot, 'package.json');
+  if (!tpl?.dependencies || !fs.existsSync(fp)) return false;
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(fp, 'utf8'));
+  } catch {
+    return false;
+  }
+  if (!pkg.dependencies || typeof pkg.dependencies !== 'object') pkg.dependencies = {};
+  let changed = false;
+  for (const name of ['react', 'react-dom']) {
+    const want = tpl.dependencies[name];
+    if (typeof want !== 'string') continue;
+    if (pkg.dependencies[name] !== want) {
+      pkg.dependencies[name] = want;
+      changed = true;
+    }
+    if (pkg.devDependencies && typeof pkg.devDependencies === 'object' && pkg.devDependencies[name]) {
+      delete pkg.devDependencies[name];
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  fs.writeFileSync(fp, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  try {
+    const lock = path.join(wsRoot, 'package-lock.json');
+    if (fs.existsSync(lock)) fs.unlinkSync(lock);
+  } catch {
+    /* */
+  }
+  logAccess(`STUDIO_REACT_DOM_CLIENT_DEPS ${wsRoot}`);
+  return true;
 }
 
 /** Удаляет управляющие символы из всех строк в дереве package.json (LLM иногда вставляет U+0012 в версии). */
@@ -1635,6 +1712,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const viteBaseOk = studioEnsureViteRelativeBase(ws);
   const indexHtmlReset = studioEnsureWorkspaceIndexHtml(ws);
   const mainEntryReset = studioEnsureWorkspaceMainEntry(ws);
+  const reactDomDepsFixed = studioEnsureReactDomClientDeps(ws);
   const lockPresent = studioWorkspaceHasNpmLockfile(ws);
   const useNpmInstall =
     !STUDIO_PREVIEW_USE_NPM_CI ||
@@ -1642,6 +1720,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     pkgSanitized ||
     indexHtmlReset ||
     mainEntryReset ||
+    reactDomDepsFixed ||
     !lockPresent ||
     npmrcSanitized;
   const headerExtra = [
@@ -1652,6 +1731,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
     mainEntryReset ? '[studio] src/main.tsx исправлен (createRoot/render и типичный мусор)' : null,
+    reactDomDepsFixed ? '[studio] добавлены react/react-dom для импорта react-dom/client' : null,
     lockPresent && useNpmInstall && STUDIO_PREVIEW_USE_NPM_CI ? '[studio] переключение на npm install' : null,
     !lockPresent && !pkgSanitized && !pkgRepaired ? '[studio] нет package-lock.json — выполняется npm install' : null,
   ]
