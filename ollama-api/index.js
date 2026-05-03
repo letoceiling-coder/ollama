@@ -572,7 +572,7 @@ const STUDIO_WORKSPACE_PATCH_MAX_OPS = Math.max(1, Number(process.env.STUDIO_WOR
 /** Лимит операций в одном ответе LLM при agent/implement (§6.1 pseudo-tool studio.patch_workspace). */
 const STUDIO_AGENT_IMPLEMENT_MAX_OPS = Math.max(
   1,
-  Math.min(STUDIO_WORKSPACE_PATCH_MAX_OPS, Number(process.env.STUDIO_AGENT_IMPLEMENT_MAX_OPS || 15)),
+  Math.min(STUDIO_WORKSPACE_PATCH_MAX_OPS, Number(process.env.STUDIO_AGENT_IMPLEMENT_MAX_OPS || 35)),
 );
 const STUDIO_AGENT_CODE_MODEL = (process.env.STUDIO_AGENT_CODE_MODEL || 'deepseek-coder:latest').trim();
 /** После ошибки сборки: сколько раз вызвать LLM-патч и повторить npm run build (0 — без автопочинки). */
@@ -665,6 +665,236 @@ function studioReadTemplatePackageJson() {
     studioTemplatePkgCache = null;
   }
   return studioTemplatePkgCache;
+}
+
+function studioJsonString(value) {
+  return JSON.stringify(String(value || ''));
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function studioTsxText(value) {
+  return escapeHtml(value).replace(/`/g, '\\`').replace(/\{/g, '&#123;').replace(/\}/g, '&#125;');
+}
+
+function studioFirstQuotedText(s) {
+  const raw = String(s || '');
+  const m = raw.match(/[“"«]([^”"»]{8,120})[”"»]/);
+  return m ? m[1].trim() : '';
+}
+
+function studioHasTemplateApp(wsRoot) {
+  const fp = path.join(wsRoot, 'src', 'App.tsx');
+  if (!fs.existsSync(fp)) return true;
+  let raw = '';
+  try {
+    raw = fs.readFileSync(fp, 'utf8');
+  } catch {
+    return true;
+  }
+  if (raw.length < 900) return true;
+  if (/Сборка шаблона|Студия\s*[·-]\s*static preview|preview after build/i.test(raw)) return true;
+  return false;
+}
+
+function studioPlanLooksLikeLanding(plan) {
+  return /\b(лендинг|landing|hero|cta|тариф|форма|заявк|консультац|saas|сайт|продаж)/i.test(
+    String(plan || ''),
+  );
+}
+
+function studioBuildGeneratedLandingApp(projectName, planMarkdown) {
+  const plan = String(planMarkdown || '');
+  const quoted = studioFirstQuotedText(plan);
+  const heroTitle = quoted || (/\bAI|ассист/i.test(plan) ? 'Внедряем AI в бизнес под ключ' : projectName || 'Современный цифровой продукт под ключ');
+  const subtitle =
+    /Автоматизируйте продажи/i.test(plan)
+      ? 'Автоматизируйте продажи, поддержку и процессы с помощью интеллектуальных ассистентов'
+      : /\bAI|ассист/i.test(plan)
+        ? 'Запускаем AI-ассистентов, которые обрабатывают обращения, квалифицируют лиды и помогают команде расти быстрее.'
+        : 'Создаём понятный интерфейс, который показывает ценность продукта, ведёт пользователя к действию и готов к подключению API.';
+  const features = /\bAI|ассист/i.test(plan)
+    ? [
+        ['AI чат для сайта', 'Консультирует посетителей, квалифицирует лиды и передаёт заявку менеджеру с полным контекстом.'],
+        ['Telegram / CRM', 'Интеграции с мессенджерами, CRM и внутренними процессами компании.'],
+        ['Генерация лидов', 'Ассистент задаёт правильные вопросы и доводит клиента до консультации или заявки.'],
+        ['Аналитика диалогов', 'Контроль качества, отчёты по возражениям и точки роста в воронке продаж.'],
+        ['Голос и видео', 'Сценарии для звонков, консультаций и поддержки с ощущением живого общения.'],
+        ['База знаний', 'Подключаем регламенты, FAQ, документы и знания компании в единую структуру.'],
+      ]
+    : [
+        ['Продуктовая презентация', 'Чётко объясняет ценность, сценарии использования и выгоды для клиента.'],
+        ['Конверсионные CTA', 'Ведёт пользователя к заявке, демо или консультации без перегруза интерфейса.'],
+        ['Адаптивный UI', 'Корректно работает на мобильных, планшетах и больших экранах.'],
+        ['Готовность к API', 'Структура компонентов позволяет быстро подключить реальные данные и формы.'],
+        ['Премиальный визуал', 'Тёмная тема, glassmorphism, мягкие свечения и аккуратные анимации.'],
+        ['Быстрая сборка', 'Vite + React + Tailwind дают лёгкий production-бандл для preview и деплоя.'],
+      ];
+  const featureLiteral = JSON.stringify(features);
+  return `import { ArrowRight, BarChart3, Bot, BrainCircuit, Check, Database, MessageCircle, Play, ShieldCheck, Sparkles, Users, Workflow, Zap } from 'lucide-react';
+import { motion } from 'framer-motion';
+
+const features = ${featureLiteral} as const;
+const cases = [
+  ['x2', 'рост конверсии', 'Пользователь быстрее понимает ценность продукта и доходит до целевого действия.'],
+  ['−40%', 'меньше ручной работы', 'Типовые сценарии автоматизированы, а команда фокусируется на важных обращениях.'],
+  ['24/7', 'приём заявок', 'Сайт продолжает продавать и собирать лиды после рабочего дня.'],
+] as const;
+const tariffs = [
+  ['Старт', 'от 79 000 ₽', ['Структура лендинга', 'Адаптивный UI', 'Форма заявки', 'Базовая аналитика']],
+  ['Бизнес', 'от 149 000 ₽', ['CRM / Telegram', 'AI-сценарии', 'Дашборд', 'A/B улучшения']],
+  ['Enterprise', 'по запросу', ['Индивидуальная архитектура', 'SLA', 'Интеграции', 'Безопасность']],
+] as const;
+const fade = { initial: { opacity: 0, y: 24 }, whileInView: { opacity: 1, y: 0 }, viewport: { once: true, margin: '-80px' }, transition: { duration: 0.65 } };
+
+function SectionTitle({ kicker, title, text }: { kicker: string; title: string; text: string }) {
+  return <motion.div {...fade} className="mx-auto mb-12 max-w-3xl text-center"><p className="mb-3 text-sm font-semibold uppercase tracking-[0.25em] text-cyan-300">{kicker}</p><h2 className="text-3xl font-semibold tracking-tight text-white md:text-5xl">{title}</h2><p className="mt-4 text-base leading-7 text-slate-300 md:text-lg">{text}</p></motion.div>;
+}
+
+function ProductMock() {
+  return <motion.div initial={{ opacity: 0, scale: 0.96, y: 28 }} animate={{ opacity: 1, scale: 1, y: 0 }} transition={{ duration: 0.8 }} className="relative mx-auto max-w-xl"><div className="absolute -inset-8 rounded-[2rem] bg-gradient-to-r from-cyan-500/30 via-indigo-500/25 to-fuchsia-500/30 blur-3xl" /><div className="glass relative overflow-hidden rounded-3xl p-4 shadow-glow"><div className="mb-4 flex items-center justify-between rounded-2xl bg-white/5 px-4 py-3"><div><p className="text-xs text-slate-400">Live product dashboard</p><p className="font-semibold text-white">Контроль заявок и диалогов</p></div><span className="rounded-full bg-emerald-400/15 px-3 py-1 text-xs text-emerald-200">Online</span></div><div className="grid gap-3 md:grid-cols-[1.15fr_.85fr]"><div className="rounded-2xl bg-slate-950/70 p-4"><div className="mb-4 flex gap-3"><Bot className="h-9 w-9 rounded-xl bg-cyan-400/15 p-2 text-cyan-200" /><div><p className="text-sm font-medium">Ассистент</p><p className="text-xs text-slate-400">Квалифицирует клиента</p></div></div><div className="space-y-3 text-sm"><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">Здравствуйте! Подберу сценарий внедрения под ваш бизнес.</p><p className="ml-8 rounded-2xl rounded-tr-sm bg-cyan-400/15 p-3 text-cyan-50">Нужно больше заявок и меньше ручной обработки.</p><p className="rounded-2xl rounded-tl-sm bg-white/10 p-3 text-slate-200">Готово. Передаю заявку: высокий приоритет, бюджет подтверждён.</p></div></div><div className="space-y-3">{['42 диалога сегодня', '18 горячих лидов', '91% качество ответов'].map((item, i) => <div key={item} className="rounded-2xl bg-white/[0.07] p-4"><p className="text-xs text-slate-400">Метрика 0{i + 1}</p><p className="mt-1 font-semibold text-white">{item}</p></div>)}</div></div></div></motion.div>;
+}
+
+export default function App() {
+  return <main className="min-h-screen overflow-hidden bg-[#050816] text-slate-100"><div className="pointer-events-none fixed inset-0 noise opacity-30" /><div className="pointer-events-none fixed left-1/2 top-0 h-[520px] w-[760px] -translate-x-1/2 rounded-full bg-indigo-600/20 blur-3xl" />
+    <header className="sticky top-0 z-40 border-b border-white/10 bg-[#050816]/75 backdrop-blur-xl"><div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4"><a href="#top" className="flex items-center gap-3 font-semibold"><span className="grid h-10 w-10 place-items-center rounded-2xl bg-gradient-to-br from-cyan-400 to-violet-500"><BrainCircuit className="h-5 w-5" /></span>${studioTsxText(projectName || 'AI внедрение')}</a><nav className="hidden items-center gap-7 text-sm text-slate-300 md:flex"><a href="#features">Возможности</a><a href="#demo">Демо</a><a href="#cases">Кейсы</a><a href="#pricing">Тарифы</a></nav><a href="#lead" className="rounded-full bg-white px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-cyan-100">Консультация</a></div></header>
+    <section id="top" className="relative mx-auto grid max-w-7xl items-center gap-12 px-5 pb-20 pt-16 md:grid-cols-2 md:pb-28 md:pt-24"><motion.div initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.75 }}><div className="mb-6 inline-flex items-center gap-2 rounded-full border border-cyan-300/25 bg-cyan-300/10 px-4 py-2 text-sm text-cyan-100"><Sparkles className="h-4 w-4" /> Премиальный SaaS-интерфейс, готовый к лидам</div><h1 className="max-w-3xl text-5xl font-semibold tracking-[-0.05em] text-white md:text-7xl">${studioTsxText(heroTitle)}</h1><p className="mt-6 max-w-xl text-lg leading-8 text-slate-300">${studioTsxText(subtitle)}</p><div className="mt-8 flex flex-col gap-3 sm:flex-row"><a href="#lead" className="group rounded-full bg-gradient-to-r from-cyan-300 to-violet-400 px-7 py-4 text-center font-semibold text-slate-950 shadow-glow">Получить консультацию <ArrowRight className="ml-2 inline h-4 w-4 transition group-hover:translate-x-1" /></a><a href="#demo" className="rounded-full border border-white/15 bg-white/8 px-7 py-4 text-center font-semibold text-white hover:bg-white/12"><Play className="mr-2 inline h-4 w-4" />Посмотреть демо</a></div><div className="mt-9 grid max-w-xl grid-cols-3 gap-3 text-center"><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">−40%</b><p className="text-xs text-slate-400">затраты</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">x2</b><p className="text-xs text-slate-400">конверсия</p></div><div className="glass rounded-2xl p-4"><b className="text-2xl text-white">24/7</b><p className="text-xs text-slate-400">лиды</p></div></div></motion.div><ProductMock /></section>
+    <section className="mx-auto max-w-7xl px-5 py-10"><motion.div {...fade} className="glass rounded-3xl p-6 md:p-8"><p className="mb-5 text-sm uppercase tracking-[0.25em] text-slate-400">Социальное доказательство</p><div className="grid gap-3 text-sm text-slate-300 md:grid-cols-5">{['Retail', 'EdTech', 'Real Estate', 'MedTech', 'B2B SaaS'].map((item) => <div key={item} className="rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-4 text-center font-medium">{item}</div>)}</div></motion.div></section>
+    <section id="features" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Возможности" title="Интерфейс, который показывает продукт и продаёт следующий шаг" text="Структура собрана под конверсию: ценность, доверие, демонстрация продукта, результаты, тарифы и форма заявки." /><div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">{features.map(([title, text], i) => { const icons = [MessageCircle, Workflow, Users, BarChart3, Database, ShieldCheck]; const Icon = icons[i] || Check; return <motion.article key={title} {...fade} className="glass group rounded-3xl p-6 transition hover:-translate-y-1 hover:border-cyan-300/35"><Icon className="mb-5 h-10 w-10 rounded-2xl bg-cyan-300/12 p-2 text-cyan-200" /><h3 className="text-xl font-semibold text-white">{title}</h3><p className="mt-3 leading-7 text-slate-300">{text}</p></motion.article>; })}</div></section>
+    <section className="mx-auto max-w-7xl px-5 py-20"><SectionTitle kicker="Как это работает" title="От идеи до запуска за 3 этапа" text="Сервис формирует структуру, собирает интерфейс и готовит production preview без ручной сборки в редакторе." /><div className="grid gap-5 md:grid-cols-3">{['Анализ цели и аудитории', 'Генерация интерфейса и контента', 'Сборка, проверка и готовое превью'].map((item, index) => <motion.div key={item} {...fade} className="glass rounded-3xl p-7"><span className="text-5xl font-semibold text-white/15">0{index + 1}</span><h3 className="mt-5 text-xl font-semibold text-white">{item}</h3><p className="mt-3 text-slate-300">Каждый этап связан с запросом пользователя и критериями приёмки из согласованного плана.</p></motion.div>)}</div></section>
+    <section id="demo" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Демо продукта" title="Чат, панель управления и показатели в одном блоке" text="Визуал показывает живой продукт: обращения, лиды, контроль качества и понятные статусы." /><ProductMock /></section>
+    <section id="cases" className="mx-auto max-w-7xl px-5 py-20"><div className="grid gap-5 md:grid-cols-3">{cases.map(([num, title, text]) => <motion.div key={title} {...fade} className="glass rounded-3xl p-7"><p className="text-5xl font-semibold text-cyan-200">{num}</p><h3 className="mt-4 text-xl font-semibold text-white">{title}</h3><p className="mt-3 text-slate-300">{text}</p></motion.div>)}</div></section>
+    <section id="pricing" className="mx-auto max-w-7xl px-5 py-24"><SectionTitle kicker="Тарифы" title="Стартуйте с нужного уровня внедрения" text="Пакеты можно заменить реальными ценами и подключить API оплаты или CRM позже." /><div className="grid gap-5 lg:grid-cols-3">{tariffs.map(([name, price, items], index) => <motion.div key={name} {...fade} className={\`rounded-3xl p-7 \${index === 1 ? 'bg-gradient-to-b from-cyan-300/20 to-violet-500/15 ring-1 ring-cyan-200/35 shadow-glow' : 'glass'}\`}><h3 className="text-2xl font-semibold text-white">{name}</h3><p className="mt-2 text-3xl font-semibold text-cyan-100">{price}</p><ul className="mt-6 space-y-3">{items.map((item) => <li key={item} className="flex gap-3 text-slate-300"><Check className="mt-1 h-4 w-4 text-emerald-300" />{item}</li>)}</ul><a href="#lead" className="mt-7 block rounded-full bg-white px-5 py-3 text-center font-semibold text-slate-950 hover:bg-cyan-100">Обсудить запуск</a></motion.div>)}</div></section>
+    <section id="lead" className="mx-auto max-w-7xl px-5 pb-28 pt-10"><div className="glass grid gap-8 rounded-[2rem] p-7 md:grid-cols-[1fr_.9fr] md:p-10"><div><p className="text-sm uppercase tracking-[0.25em] text-cyan-300">Заявка</p><h2 className="mt-3 text-3xl font-semibold text-white md:text-5xl">Получите бесплатный разбор проекта</h2><p className="mt-5 max-w-xl text-slate-300">Оставьте контакты — команда сможет подключить API, CRM или реальные формы на следующем этапе.</p></div><form className="space-y-4 rounded-3xl bg-slate-950/55 p-5"><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Ваше имя" /><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Телефон" /><input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-4 outline-none focus:border-cyan-300" placeholder="Telegram" /><button type="button" className="w-full rounded-2xl bg-gradient-to-r from-cyan-300 to-violet-400 px-5 py-4 font-semibold text-slate-950">Получить разбор</button><p className="text-xs text-slate-500">Форма готова для подключения API позже.</p></form></div></section>
+    <footer className="border-t border-white/10 px-5 py-8"><div className="mx-auto flex max-w-7xl flex-col justify-between gap-4 text-sm text-slate-400 md:flex-row"><p>© 2026 ${studioTsxText(projectName || 'AI продукт')}</p><p>Telegram · WhatsApp · hello@example.com</p></div></footer>
+    <a href="#lead" className="fixed bottom-5 right-5 z-50 flex items-center gap-3 rounded-full border border-cyan-200/30 bg-slate-950/85 px-5 py-4 text-sm font-semibold text-white shadow-glow backdrop-blur-xl hover:bg-slate-900"><Zap className="h-5 w-5 text-cyan-200" />Оставить заявку</a>
+  </main>;
+}
+`;
+}
+
+function studioWriteGeneratedFrontend(wsRoot, projectName, planMarkdown, reason) {
+  fs.mkdirSync(path.join(wsRoot, 'src'), { recursive: true });
+  const pkg = {
+    name: 'studio-generated-product',
+    version: '1.0.0',
+    private: true,
+    type: 'module',
+    scripts: { dev: 'vite', build: 'vite build', preview: 'vite preview' },
+    dependencies: {
+      '@vitejs/plugin-react': '^4.3.4',
+      vite: '^6.0.1',
+      typescript: '~5.6.2',
+      react: '^18.3.1',
+      'react-dom': '^18.3.1',
+      'framer-motion': '^11.0.0',
+      'lucide-react': '^0.469.0',
+    },
+    devDependencies: {
+      tailwindcss: '^3.4.17',
+      postcss: '^8.4.49',
+      autoprefixer: '^10.4.20',
+    },
+  };
+  fs.writeFileSync(path.join(wsRoot, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(
+    path.join(wsRoot, 'index.html'),
+    `<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(projectName || 'Studio product')}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+`,
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(wsRoot, 'tailwind.config.js'),
+    `/** @type {import('tailwindcss').Config} */
+export default {
+  content: ['./index.html', './src/**/*.{ts,tsx,js,jsx}'],
+  theme: {
+    extend: {
+      boxShadow: { glow: '0 0 80px rgba(99,102,241,.35)' },
+    },
+  },
+  plugins: [],
+};
+`,
+    'utf8',
+  );
+  fs.writeFileSync(path.join(wsRoot, 'postcss.config.js'), `export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n`, 'utf8');
+  fs.writeFileSync(
+    path.join(wsRoot, 'src', 'index.css'),
+    `@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: #050816; color: #eef2ff; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+* { box-sizing: border-box; }
+.noise { background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,.08) 1px, transparent 0); background-size: 24px 24px; }
+.glass { background: linear-gradient(145deg, rgba(255,255,255,.10), rgba(255,255,255,.045)); border: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(22px); }
+`,
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(wsRoot, 'src', 'main.tsx'),
+    `import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);
+`,
+    'utf8',
+  );
+  fs.writeFileSync(path.join(wsRoot, 'src', 'App.tsx'), studioBuildGeneratedLandingApp(projectName, planMarkdown), 'utf8');
+  for (const rel of ['package-lock.json', STUDIO_PREVIEW_DIST_DIR]) {
+    try {
+      fs.rmSync(path.join(wsRoot, rel), { recursive: true, force: true });
+    } catch {
+      /* */
+    }
+  }
+  logAccess(`STUDIO_GENERATED_FRONTEND reason=${reason || 'fallback'} ws=${wsRoot}`);
+  return true;
+}
+
+function studioEnsureProductFrontend(wsRoot, projectName, planMarkdown, reason) {
+  if (!studioHasTemplateApp(wsRoot) && !studioPlanLooksLikeLanding(planMarkdown)) return false;
+  const appPath = path.join(wsRoot, 'src', 'App.tsx');
+  let app = '';
+  try {
+    app = fs.existsSync(appPath) ? fs.readFileSync(appPath, 'utf8') : '';
+  } catch {
+    app = '';
+  }
+  const plan = String(planMarkdown || '');
+  const hero = studioFirstQuotedText(plan);
+  const appStillGeneric =
+    studioHasTemplateApp(wsRoot) ||
+    !/href="#lead"|id="lead"|Получить|заявк|консультац/i.test(app) ||
+    (hero && !app.includes(hero));
+  if (!appStillGeneric) return false;
+  return studioWriteGeneratedFrontend(wsRoot, projectName, planMarkdown, reason);
 }
 
 /** Удаляет обратный слэш перед недопустимой в JSON escape-последовательностью (модель пишет \\w и т.д.). */
@@ -1762,6 +1992,12 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const project = data.studioProjects.find((p) => p.id === projectId);
   const planMd = project?.plan?.markdown || '';
   if (planMd) studioWritePlanArtifact(userId, projectId, planMd);
+  const productGenerated = studioEnsureProductFrontend(
+    ws,
+    typeof project?.name === 'string' ? project.name : 'Studio product',
+    planMd,
+    'pre_build_guard',
+  );
 
   const npmrcSanitized = studioSanitizeWorkspaceNpmrc(ws);
   const pkgRepaired = studioRepairCorruptWorkspacePackageJson(ws);
@@ -1774,6 +2010,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const useNpmInstall =
     !STUDIO_PREVIEW_USE_NPM_CI ||
     pkgRepaired ||
+    productGenerated ||
     pkgSanitized ||
     indexHtmlReset ||
     mainEntryReset ||
@@ -1784,6 +2021,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
     !STUDIO_PREVIEW_USE_NPM_CI ? '[studio] npm install (по умолчанию: lock подстраивается под package.json)' : null,
     npmrcSanitized ? '[studio] очищен .npmrc (production/omit=dev)' : null,
     pkgRepaired ? '[studio] исправлен повреждённый package.json (управляющие символы)' : null,
+    productGenerated ? '[studio] сгенерирован frontend из согласованного плана (не шаблон)' : null,
     pkgSanitized ? '[studio] скорректирован package.json (typos/ lucide); lock пересоздаётся' : null,
     viteBaseOk ? "[studio] vite base → './' (ассеты превью под /preview/…)" : null,
     indexHtmlReset ? '[studio] index.html заменён эталоном (module + /src/main.tsx)' : null,
@@ -2198,6 +2436,9 @@ function buildStudioJsonOpsPrompt({
 Правила:
 - Пути POSIX, без ".." и без ведущего /.
 - Не используй корни node_modules, dist, .git, .vite.
+- Если это лендинг/сайт/продуктовый интерфейс, ОБЯЗАТЕЛЬНО запиши полноценный \`src/App.tsx\` под утверждённый план: hero, CTA, секции, форма/демо/карточки, осмысленный русский контент. Нельзя оставлять шаблон \`Сборка шаблона прошла успешно\`.
+- Для React+Tailwind проекта обычно нужны \`src/App.tsx\`, \`src/main.tsx\`, \`src/index.css\`, \`index.html\`, \`package.json\`, \`tailwind.config.js\`, \`postcss.config.js\`.
+- Не используй lorem ipsum и не оставляй placeholder UI. Результат должен выглядеть как готовый продукт по запросу пользователя.
 - В package.json для иконок: **lucide-react** только как \`^1.0.0\` или \`^0.469.0\` (или другой реальный 0.4xx). **Не указывай \`^0.5.0\`** — на npm нет подходящих версий (npm ci падает с ETARGET). Имя пакета: **lucide-react**, не \`licide-react\`. Tailwind: пакет **tailwindcss**, не \`tailwind-css\`.
 - Версии в dependencies: только печатные символы, без управляющих Unicode (иначе npm не прочитает package.json).
 ${headLine}
@@ -2966,8 +3207,16 @@ async function executeStudioAgentRun(runId) {
     return;
   }
 
+  const generatedFallback = studioEnsureProductFrontend(
+    ws,
+    taskTitle || 'Studio product',
+    taskPlanMd || projPlanMd,
+    'agent_run_guard',
+  );
+
   emitStudioAgentEvent(runId, 'revision', {
     applied: patchOut.applied,
+    generated_fallback: generatedFallback,
     revision_id: null,
   });
 
@@ -4634,10 +4883,16 @@ app.post('/api/studio/projects/:projectId/agent/apply-approved-plan', async (req
       res.status(413).json({ error: patchOut.err || 'file_too_large', at: patchOut.at });
       return;
     }
-    logAccess(
-      `STUDIO_APPLY_APPROVED_PLAN user=${req.userId} project=${projectId} applied=${patchOut.applied}`,
+    const generatedFallback = studioEnsureProductFrontend(
+      ws,
+      peek.projectName,
+      peek.projPlanMd,
+      'post_apply_guard',
     );
-    res.status(200).json({ applied: patchOut.applied, revision_id: null });
+    logAccess(
+      `STUDIO_APPLY_APPROVED_PLAN user=${req.userId} project=${projectId} applied=${patchOut.applied} generatedFallback=${generatedFallback ? 1 : 0}`,
+    );
+    res.status(200).json({ applied: patchOut.applied, generated_fallback: generatedFallback, revision_id: null });
   } catch (e) {
     logError(`STUDIO_APPLY_APPROVED_PLAN ${e.stack || e.message}`);
     res.status(500).json({ error: 'storage_error' });
