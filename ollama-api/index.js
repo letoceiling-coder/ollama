@@ -780,6 +780,23 @@ export default function App() {
 }
 
 function studioWriteGeneratedFrontend(wsRoot, projectName, planMarkdown, reason) {
+  function writeRel(rel, content) {
+    const safe = studioSanitizeRelativePath(rel);
+    if (!safe) throw new Error(`bad_generated_path:${rel}`);
+    const fp = path.join(wsRoot, safe);
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    try {
+      fs.writeFileSync(fp, content, 'utf8');
+      return;
+    } catch (e) {
+      try {
+        fs.rmSync(fp, { force: true, recursive: true });
+      } catch {
+        studioDockerRootRm(wsRoot, safe);
+      }
+      fs.writeFileSync(fp, content, 'utf8');
+    }
+  }
   fs.mkdirSync(path.join(wsRoot, 'src'), { recursive: true });
   const pkg = {
     name: 'studio-generated-product',
@@ -802,9 +819,9 @@ function studioWriteGeneratedFrontend(wsRoot, projectName, planMarkdown, reason)
       autoprefixer: '^10.4.20',
     },
   };
-  fs.writeFileSync(path.join(wsRoot, 'package.json'), `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
-  fs.writeFileSync(
-    path.join(wsRoot, 'index.html'),
+  writeRel('package.json', `${JSON.stringify(pkg, null, 2)}\n`);
+  writeRel(
+    'index.html',
     `<!doctype html>
 <html lang="ru">
   <head>
@@ -818,10 +835,9 @@ function studioWriteGeneratedFrontend(wsRoot, projectName, planMarkdown, reason)
   </body>
 </html>
 `,
-    'utf8',
   );
-  fs.writeFileSync(
-    path.join(wsRoot, 'tailwind.config.js'),
+  writeRel(
+    'tailwind.config.js',
     `/** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx,js,jsx}'],
@@ -833,11 +849,10 @@ export default {
   plugins: [],
 };
 `,
-    'utf8',
   );
-  fs.writeFileSync(path.join(wsRoot, 'postcss.config.js'), `export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n`, 'utf8');
-  fs.writeFileSync(
-    path.join(wsRoot, 'src', 'index.css'),
+  writeRel('postcss.config.js', `export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n`);
+  writeRel(
+    'src/index.css',
     `@tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -849,10 +864,9 @@ body { margin: 0; background: #050816; color: #eef2ff; font-family: Inter, ui-sa
 .noise { background-image: radial-gradient(circle at 1px 1px, rgba(255,255,255,.08) 1px, transparent 0); background-size: 24px 24px; }
 .glass { background: linear-gradient(145deg, rgba(255,255,255,.10), rgba(255,255,255,.045)); border: 1px solid rgba(255,255,255,.12); backdrop-filter: blur(22px); }
 `,
-    'utf8',
   );
-  fs.writeFileSync(
-    path.join(wsRoot, 'src', 'main.tsx'),
+  writeRel(
+    'src/main.tsx',
     `import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
@@ -864,9 +878,8 @@ createRoot(document.getElementById('root')!).render(
   </React.StrictMode>,
 );
 `,
-    'utf8',
   );
-  fs.writeFileSync(path.join(wsRoot, 'src', 'App.tsx'), studioBuildGeneratedLandingApp(projectName, planMarkdown), 'utf8');
+  writeRel('src/App.tsx', studioBuildGeneratedLandingApp(projectName, planMarkdown));
   for (const rel of ['package-lock.json', STUDIO_PREVIEW_DIST_DIR]) {
     try {
       fs.rmSync(path.join(wsRoot, rel), { recursive: true, force: true });
