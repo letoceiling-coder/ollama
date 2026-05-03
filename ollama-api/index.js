@@ -933,6 +933,48 @@ function studioExistingPreviewDistRoot(wsRoot) {
   return studioLegacyPreviewDistRoot(wsRoot);
 }
 
+function studioDockerRootRm(workspaceRoot, relPath) {
+  const safeRel = studioSanitizeRelativePath(relPath);
+  if (!safeRel) return false;
+  const mountSrc = hostPathForDockerVolume(workspaceRoot);
+  const r = spawnSync(
+    'docker',
+    [
+      'run',
+      '--rm',
+      '--user',
+      '0:0',
+      '-v',
+      `${mountSrc}:/workspace`,
+      '-w',
+      '/workspace',
+      STUDIO_DOCKER_IMAGE,
+      'sh',
+      '-lc',
+      `rm -rf -- ${JSON.stringify(safeRel)}`,
+    ],
+    { encoding: 'utf8', timeout: 30000 },
+  );
+  if (r.status === 0) return true;
+  logError(`STUDIO_DOCKER_ROOT_RM_FAIL ${workspaceRoot}/${safeRel}: ${(r.stderr || r.stdout || '').slice(-500)}`);
+  return false;
+}
+
+function studioCleanPreviewOutDir(wsRoot, executor) {
+  const dir = studioPreviewDistRoot(wsRoot);
+  if (!fs.existsSync(dir)) return false;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    if (executor === 'docker' && studioDockerRootRm(wsRoot, STUDIO_PREVIEW_DIST_DIR)) {
+      return true;
+    }
+    logError(`STUDIO_PREVIEW_OUTDIR_CLEAN_FAIL ${dir}: ${e.message || e}`);
+    return false;
+  }
+}
+
 function studioValidateVitePreviewDist(wsRoot) {
   const dist = studioPreviewDistRoot(wsRoot);
   const idx = path.join(dist, 'index.html');
@@ -1761,6 +1803,7 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   if (r1.code !== 0) {
     return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
   }
+  const outDirCleaned = studioCleanPreviewOutDir(ws, executor);
   const r2 = await runNpm(ws, ['run', 'build', '--', '--outDir', STUDIO_PREVIEW_DIST_DIR, '--emptyOutDir'], STUDIO_BUILD_TIMEOUT_MS);
   let buildOk = r2.code === 0;
   let r2Log = r2.log;
@@ -1776,7 +1819,8 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
       r2Log = `${r2Log}\n=== studio: проверка dist ===\nFAIL: ${check.reason}\n`;
     }
   }
-  const combined = `${header}${r1Label}\n${r1.log}\n=== npm run build ===\n${r2Log}`;
+  const cleanLog = outDirCleaned ? `\n[studio] очищен ${STUDIO_PREVIEW_DIST_DIR} перед build` : '';
+  const combined = `${header}${r1Label}\n${r1.log}${cleanLog}\n=== npm run build ===\n${r2Log}`;
   const finalExit = buildOk ? 0 : r2.code !== 0 ? r2.code : 1;
   return { ok: buildOk, exitCode: finalExit, chunk: combined };
 }
