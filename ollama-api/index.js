@@ -1276,6 +1276,21 @@ function studioCleanPreviewOutDir(wsRoot, executor) {
   }
 }
 
+function studioCleanWorkspaceRelPath(wsRoot, relPath, executor) {
+  const safeRel = studioSanitizeRelativePath(relPath);
+  if (!safeRel) return false;
+  const fp = path.join(wsRoot, safeRel);
+  if (!fs.existsSync(fp)) return false;
+  try {
+    fs.rmSync(fp, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    if (executor === 'docker' && studioDockerRootRm(wsRoot, safeRel)) return true;
+    logError(`STUDIO_WORKSPACE_CLEAN_FAIL ${fp}: ${e.message || e}`);
+    return false;
+  }
+}
+
 function studioValidateVitePreviewDist(wsRoot) {
   const dist = studioPreviewDistRoot(wsRoot);
   const idx = path.join(dist, 'index.html');
@@ -2112,10 +2127,12 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
   const npmInstallCmd = useNpmInstall
     ? ['install', '--no-audit', '--no-fund', '--include=dev', '--legacy-peer-deps']
     : ['ci', '--no-audit', '--no-fund', '--include=dev', '--legacy-peer-deps'];
+  const nodeModulesCleaned = useNpmInstall ? studioCleanWorkspaceRelPath(ws, 'node_modules', executor) : false;
   const r1 = await runNpm(ws, npmInstallCmd, STUDIO_BUILD_TIMEOUT_MS);
   const r1Label = useNpmInstall ? '=== npm install ===' : '=== npm ci ===';
   if (r1.code !== 0) {
-    return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}\n${r1.log}` };
+    const preInstallCleanLog = nodeModulesCleaned ? '\n[studio] очищен node_modules перед npm install' : '';
+    return { ok: false, exitCode: r1.code, chunk: `${header}${r1Label}${preInstallCleanLog}\n${r1.log}` };
   }
   const outDirCleaned = studioCleanPreviewOutDir(ws, executor);
   const r2 = await runNpm(ws, ['run', 'build', '--', '--outDir', STUDIO_PREVIEW_DIST_DIR, '--emptyOutDir'], STUDIO_BUILD_TIMEOUT_MS);
@@ -2133,8 +2150,9 @@ async function runStudioPreviewBuildAttempt(userId, projectId, runNpm, executor)
       r2Log = `${r2Log}\n=== studio: проверка dist ===\nFAIL: ${check.reason}\n`;
     }
   }
+  const preInstallCleanLog = nodeModulesCleaned ? '\n[studio] очищен node_modules перед npm install' : '';
   const cleanLog = outDirCleaned ? `\n[studio] очищен ${STUDIO_PREVIEW_DIST_DIR} перед build` : '';
-  const combined = `${header}${r1Label}\n${r1.log}${cleanLog}\n=== npm run build ===\n${r2Log}`;
+  const combined = `${header}${r1Label}${preInstallCleanLog}\n${r1.log}${cleanLog}\n=== npm run build ===\n${r2Log}`;
   const finalExit = buildOk ? 0 : r2.code !== 0 ? r2.code : 1;
   return { ok: buildOk, exitCode: finalExit, chunk: combined };
 }
